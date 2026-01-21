@@ -65,6 +65,13 @@ class GameServer {
   void SendFoodUpdate(Snake *ptr);
   void BroadcastDebug();
   void BroadcastUpdates();
+
+  void BroadcastLeaderboard();
+  void BroadcastMinimap();
+
+  long last_leaderboard_time = 0;
+  long last_minimap_time = 0;
+
   SessionIter LoadSessionIter(snake_id_t id);
 
   void DoSnake(snake_id_t id, std::function<void(Snake *)> f);

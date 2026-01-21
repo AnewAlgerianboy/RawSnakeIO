@@ -100,6 +100,22 @@ void GameServer::on_timer(error_code const &ec) {
   BroadcastUpdates();
   RemoveDeadSnakes();
 
+  // ---------------------------------------------------------
+  // Broadcast Leaderboard (Every 2 seconds)
+  // ---------------------------------------------------------
+  if (now - last_leaderboard_time > 2000) {
+      BroadcastLeaderboard();
+      last_leaderboard_time = now;
+  }
+
+  // ---------------------------------------------------------
+  // Broadcast Minimap (Every 1 second)
+  // ---------------------------------------------------------
+  if (now - last_minimap_time > 1000) {
+      BroadcastMinimap();
+      last_minimap_time = now;
+  }
+
   const long step_time = GetCurrentTime() - now;
   if (step_time > 10) {
     endpoint.get_alog().write(alevel::app,
@@ -275,6 +291,133 @@ void GameServer::BroadcastUpdates() {
   }
 
   world.FlushChanges();
+}
+
+void GameServer::BroadcastLeaderboard() {
+  // 1. Collect all snakes
+  std::vector<std::shared_ptr<Snake>> sorted_snakes;
+  for (auto &pair : world.GetSnakes()) {
+    sorted_snakes.push_back(pair.second);
+  }
+
+  // 2. Sort descending by Score (Length + Fullness)
+  std::sort(sorted_snakes.begin(), sorted_snakes.end(), 
+      [](const std::shared_ptr<Snake>& a, const std::shared_ptr<Snake>& b) {
+          return a->get_snake_score() > b->get_snake_score();
+  });
+
+  // 3. Prepare the Top 10 list (Base Packet)
+  packet_leaderboard lb_base;
+  lb_base.players = static_cast<uint16_t>(sorted_snakes.size());
+  
+  size_t top_count = std::min((size_t)10, sorted_snakes.size());
+  for(size_t i = 0; i < top_count; i++) {
+      lb_base.top.push_back(sorted_snakes[i]);
+  }
+
+  // 4. Send to each player individually using Iterator
+  for (auto it = sessions.begin(); it != sessions.end(); ++it) {
+      Session &sess = it->second;
+
+      // Skip players who haven't spawned yet (snake_id 0)
+      if (sess.snake_id == 0) continue;
+
+      // Find this player's rank
+      uint16_t my_rank = 0;
+      for(size_t i = 0; i < sorted_snakes.size(); i++) {
+          if(sorted_snakes[i]->id == sess.snake_id) {
+              my_rank = i + 1;
+              break;
+          }
+      }
+
+      // Copy base packet and add specific rank data
+      packet_leaderboard lb_packet = lb_base;
+      lb_packet.local_rank = my_rank;
+      // leaderboard_rank is usually 0 unless you are IN the top 10
+      lb_packet.leaderboard_rank = (my_rank <= 10) ? (uint8_t)my_rank : 0;
+
+      // FIX: Pass the iterator 'it' to send_binary
+      send_binary(it, lb_packet);
+  }
+}
+
+void GameServer::BroadcastMinimap() {
+  packet_minimap map_packet;
+
+  // 1. Define Map Grid (80x80 is standard client size)
+  const int map_dim = 80;
+  // Initialize with 0s
+  std::vector<uint8_t> grid(map_dim * map_dim, 0);
+
+  // 2. Map World Coordinates to Grid Coordinates
+  // We map 0..43200 (2 * game_radius) directly to 0..80.
+  // scale = 80 / 43200
+  float scale = 80.0f / (WorldConfig::game_radius * 2.0f);
+
+  for (auto &pair : world.GetSnakes()) {
+    Snake* s = pair.second.get();
+    if (s->parts.empty()) continue;
+
+    // Optimization: Map HEAD and every 4th body part
+    for (size_t i = 0; i < s->parts.size(); i += 4) {
+      const Body& b = s->parts[i];
+      
+      // FIX: Direct mapping without offset. b.x/b.y are already absolute world coords (0..43200)
+      int mx = static_cast<int>(b.x * scale);
+      int my = static_cast<int>(b.y * scale);
+
+      if (mx >= 0 && mx < map_dim && my >= 0 && my < map_dim) {
+        grid[my * map_dim + mx] = 1; // Mark pixel
+      }
+    }
+  }
+
+  // 3. Compress for Client (RLE-like encoding)
+  // Protocol:
+  // Byte >= 128: skip (value - 128) pixels
+  // Byte < 128: repeat for every bit (from 64-bit to 1-bit)
+  int current_skip = 0;
+  
+  for (size_t i = 0; i < grid.size(); ) {
+    if (grid[i] == 0) {
+      current_skip++;
+      // Max skip in one byte is 127 (255 - 128 = 127)
+      if (current_skip >= 127) {
+        map_packet.data.push_back(static_cast<uint8_t>(128 + current_skip));
+        current_skip = 0;
+      }
+      i++;
+    } else {
+      // Flush any pending skips
+      if (current_skip > 0) {
+        map_packet.data.push_back(static_cast<uint8_t>(128 + current_skip));
+        current_skip = 0;
+      }
+      
+      // Encode next 7 pixels into 1 byte (bits 6 down to 0)
+      // Note: "from 64-bit to 1-bit" corresponds to values 64, 32, 16, 8, 4, 2, 1
+      uint8_t chunk = 0;
+      for (int bit = 0; bit < 7; ++bit) {
+        if (i + bit < grid.size()) {
+          if (grid[i + bit] != 0) {
+             chunk |= (1 << (6 - bit));
+          }
+        }
+      }
+      
+      map_packet.data.push_back(chunk);
+      i += 7; // Advance by 7 pixels
+    }
+  }
+  
+  // Flush final skips
+  if (current_skip > 0) {
+    map_packet.data.push_back(static_cast<uint8_t>(128 + current_skip));
+  }
+
+  // 4. Broadcast to all players
+  broadcast_binary(map_packet);
 }
 
 void GameServer::SendPOVUpdateTo(SessionIter ses_i, Snake *ptr) {
