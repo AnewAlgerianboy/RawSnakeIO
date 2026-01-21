@@ -45,3 +45,7 @@ third_party/slither_client/
 
 # Vagrant
 .vagrant
+
+*.py
+
+src/merged_js.txt
