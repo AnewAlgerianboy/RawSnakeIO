@@ -107,19 +107,25 @@ class Snake : public std::enable_shared_from_this<Snake> {
   std::shared_ptr<Snake> get_ptr();
   BoundBox get_new_box() const;
 
+  // VANILLA CONSTANTS (Extracted from Main.as)
   static constexpr float spangdv = 4.8f;
-  static constexpr float nsp1 = 5.39f;
+  
+  // Base Speed (5.39 client units -> ~172 server units)
+  static constexpr float nsp1 = 5.39f; 
   static constexpr float nsp2 = 0.4f;
-  static constexpr float nsp3 = 14.0f;
+  
+  // Boost Speed (14.0 client units -> ~448 server units)
+  static constexpr float nsp3 = 14.0f; 
 
-  static const uint16_t base_move_speed = 185;  // pixel in second (convert:  1000*sp/32)
-  static const uint16_t boost_speed = 448;  // pixel in second (convert:  1000*sp/32)
-  static const uint16_t speed_acceleration = 1000;  // pixel in second
+  // Server speeds (approximate int conversions: client_val * 32)
+  static const uint16_t base_move_speed = 172; 
+  static const uint16_t boost_speed = 448;     
+  static const uint16_t speed_acceleration = 1000;
 
-  static constexpr float prey_angular_speed = 3.5f;  // radian in second (convert: 1000ms/8ms * ang[rad])
-  static constexpr float snake_angular_speed = 4.125f;  // radian in second (convert:  1000ms/8ms * ang[rad])
-  static constexpr float snake_tail_k = 0.43f;  // snake tail rigidity (0 .. 0.5]
-
+  static constexpr float snake_angular_speed = 4.125f; 
+  static constexpr float prey_angular_speed = 3.5f;    
+  static constexpr float snake_tail_k = 0.43f; 
+  
   static const int parts_skip_count = 3;
   static const int parts_start_move_count = 4;
   static constexpr float tail_step_distance = 24.0f;  // tail step eval for step dist = 42, k = 0.43

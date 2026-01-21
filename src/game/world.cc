@@ -105,17 +105,37 @@ void World::CheckSnakeBounds(Snake *s) {
   static std::vector<snake_id_t> cs_cache;
   cs_cache.clear();
 
-  // world bounds
-  const Body &head = s->get_head();
-  if (head.DistanceSquared(WorldConfig::game_radius, WorldConfig::game_radius) >=
+  // ==========================================
+  // START: Tip of the Head Logic
+  // ==========================================
+  
+  // 1. Calculate Geometry
+  float center_x = s->get_head_x();
+  float center_y = s->get_head_y();
+  float angle = s->angle;
+  float body_radius = s->get_snake_body_part_radius();
+
+  // 2. Calculate Tip Coordinates (The "Hurt Point")
+  float tip_x = center_x + cosf(angle) * body_radius;
+  float tip_y = center_y + sinf(angle) * body_radius;
+
+  // 3. World bounds check
+  // FIX: Cast game_radius to float to resolve ambiguity
+  if (Math::distance_squared(tip_x, tip_y, 
+                             static_cast<float>(WorldConfig::game_radius), 
+                             static_cast<float>(WorldConfig::game_radius)) >=
       WorldConfig::death_radius * WorldConfig::death_radius) {
     s->update |= change_dying;
     return;
   }
 
-  // because we check after move being made
-  BoundBoxPos check(s->get_head_x(), s->get_head_y(),
-               s->get_snake_body_part_radius());
+  // 4. Create the Hitbox
+  // We define the hitbox at the Tip position with a reduced radius (0.2f)
+  BoundBoxPos check(tip_x, tip_y, body_radius * 0.2f);
+
+  // ==========================================
+  // END: Tip of the Head Logic
+  // ==========================================
 
   // check bound coverage
   const int16_t sx = static_cast<int16_t>(check.x / WorldConfig::sector_size);
