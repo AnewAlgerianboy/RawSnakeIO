@@ -226,43 +226,101 @@ void Snake::InitBoxNewSectors(SectorSeq *ss) {
 }
 
 void Snake::UpdateEatenFood(SectorSeq *ss) {
-  const uint16_t hx = static_cast<uint16_t>(get_head_x());
-  const uint16_t hy = static_cast<uint16_t>(get_head_y());
-  const uint16_t r = static_cast<uint16_t>(14 + get_snake_body_part_radius() +
-                                           WorldConfig::move_step_distance);
-  const int32_t r2 = r * r;
+  // =========================================================
+  // VANILLA EATING ALGORITHM (Derived from Main.as)
+  // =========================================================
 
-  const uint16_t sx = hx / WorldConfig::sector_size;
-  const uint16_t sy = hy / WorldConfig::sector_size;
+  // 1. Get Head Position
+  float head_x = get_head_x();
+  float head_y = get_head_y();
 
-  // head sector
-  {
-    Sector *sec = ss->get_sector(sx, sy);
-    auto begin = sec->food.begin();
-    auto i = sec->FindClosestFood(hx);
-    // to left
-    {
-      auto left = i - 1;
-      while (left >= begin && Math::distance_squared(left->x, left->y, hx, hy) <= r2) {
-        // std::cout << "eaten food <left> x = " << left->x << ", y = " <<
-        // left->y << std::endl;
-        on_food_eaten(*left);
-        sec->Remove(left);
-        i--;
-        left--;
+  // 2. Calculate Scale Math
+  // 'sc' is calculated in UpdateSnakeConsts. 
+  // We need sc^1.3 for the radius calculation (variable 'sc13' in client).
+  float sc13 = powf(sc, 1.3f);
+  
+  // lsz (Line Size / Width) - Base width is 29.0
+  float lsz = 29.0f * sc; 
+
+  // 3. Calculate Mouth Position (Projected Forward)
+  // Original AS3: nx = xx + cos(ang) * (0.36 * lsz + 31) * sp / 4.8;
+  
+  // We first convert server speed (int) to client speed (float).
+  // In your config, base speed 185 roughly maps to client speed 5.7. 
+  // The conversion factor is roughly 32.0.
+  float client_sp = speed / 32.0f;
+  
+  // Calculate the projection distance
+  float forward_dist = (0.36f * lsz + 31.0f) * (client_sp / 4.8f);
+  
+  // Project the mouth point
+  float mouth_x = head_x + cosf(angle) * forward_dist;
+  float mouth_y = head_y + sinf(angle) * forward_dist;
+
+  // 4. Calculate Eat Radius
+  // Original AS3: dcsc = 1600 * sc13; (This is distance squared)
+  // Base radius is sqrt(1600) = 40.0f
+  float eat_radius_sq = 1600.0f * sc13; 
+  float eat_radius = sqrtf(eat_radius_sq);
+
+  // =========================================================
+  // SECTOR SEARCH
+  // =========================================================
+
+  // Convert float mouth coords to sector indices
+  const int16_t sx = static_cast<int16_t>(mouth_x / WorldConfig::sector_size);
+  const int16_t sy = static_cast<int16_t>(mouth_y / WorldConfig::sector_size);
+
+  // Boundary checks
+  if (sx < 0 || sx >= WorldConfig::sector_count_along_edge ||
+      sy < 0 || sy >= WorldConfig::sector_count_along_edge) {
+      return;
+  }
+
+  Sector *sec = ss->get_sector(sx, sy);
+  
+  // Optimization: Find food closest to our mouth X coordinate
+  auto begin = sec->food.begin();
+  auto i = sec->FindClosestFood(static_cast<uint16_t>(mouth_x));
+
+  // 1. Check Backward (Left in vector)
+  auto left = i - 1;
+  while (left >= begin) {
+      float dx = left->x - mouth_x;
+      
+      // Optimization: if X distance squared > eat_radius_sq, stop.
+      // (Since list is sorted by X, we can break early)
+      if (dx * dx > eat_radius_sq) { 
+          // Check sign to ensure we only break if we are truly out of range to the left
+          if (dx < -eat_radius) break; 
       }
-    }
-    // to right
-    {
-      auto end = sec->food.end();
-      while (i < end && Math::distance_squared(i->x, i->y, hx, hy) <= r2) {
-        // std::cout << "eaten food <right> x = " << i->x << ", y = " << i->y <<
-        // std::endl;
-        on_food_eaten(*i);
-        sec->Remove(i);
-        end--;
+
+      // Exact Distance Check
+      if (Math::distance_squared(static_cast<float>(left->x), static_cast<float>(left->y), mouth_x, mouth_y) <= eat_radius_sq) {
+          on_food_eaten(*left);
+          sec->Remove(left);
+          i--; // Adjust iterator because elements shifted
       }
-    }
+      left--;
+  }
+
+  // 2. Check Forward (Right in vector)
+  auto end = sec->food.end();
+  while (i < end) {
+      float dx = i->x - mouth_x;
+      
+      if (dx * dx > eat_radius_sq) {
+          if (dx > eat_radius) break;
+      }
+
+      if (Math::distance_squared(static_cast<float>(i->x), static_cast<float>(i->y), mouth_x, mouth_y) <= eat_radius_sq) {
+          on_food_eaten(*i);
+          sec->Remove(i);
+          end--; // Array size decreased
+          // Don't increment 'i' because next element slid into this slot
+      } else {
+          i++;
+      }
   }
 }
 
