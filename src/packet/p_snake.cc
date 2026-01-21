@@ -8,36 +8,37 @@ std::ostream& operator<<(std::ostream& out, const packet_add_snake& p) {
   // Protocol 11 Header Layout
   out << write_uint16(s->id);
   out << write_ang24(s->angle); // ehang (3 bytes)
-  out << write_uint8(0);        // Unused 8th byte (always 0)
+  out << write_uint8(0);        // Unused 8th byte (always 0, original trace had 0x30 but 0 is safe)
   out << write_ang24(s->wangle); // wang (3 bytes)
-  out << write_uint16(static_cast<uint16_t>(s->speed * 1000.0f / 32.0f)); // Speed is typically value/1E3
+  out << write_uint16(static_cast<uint16_t>(s->speed * 1000.0f / 32.0f)); // Speed
   out << write_fp24(s->fullness / 100.0f);
   out << write_uint8(s->skin);
   out << write_uint24(s->get_head_x() * 5.0f);
   out << write_uint24(s->get_head_y() * 5.0f);
   
   // Name
-  out << write_string(s->name); // Handles length + string
+  // MUST use write_string to ensure the [Length][String] format.
+  // Original trace: 03 31 32 33 (Len: 3, "123")
+  out << write_string(s->name); 
 
-  // Custom Skin Data (New in Proto 11)
-  // Logic: Write length (0 if none) then bytes
+  // Custom Skin Data
+  // Standard format: [Length][Data]
+  // Note: write_string automatically writes the length byte first.
   if (s->custom_skin_data.empty()) {
       out << write_uint8(0);
   } else {
-      // write_string automatically writes [Len][Data]
-      // Ensure we don't overflow the length byte if data > 255
+      // Safety clamp for skin data length (max 255)
       if (s->custom_skin_data.size() > 255) {
-          // Fallback/Clamp if data is too big (shouldn't happen in standard proto)
           out << write_uint8(255); 
           out.write(s->custom_skin_data.data(), 255);
       } else {
-          out << write_string(s->custom_skin_data); // This writes len + bytes
+          out << write_string(s->custom_skin_data);
       }
   }
 
-  // FIX: Add 1 byte padding required by client parser.
-  // The client logic is: `p += skl; p++;` (Skip skin length, then skip one more byte).
-  // Without this, the client reads the X coordinate from the wrong byte.
+  // Padding / Accessory ID
+  // This byte is CRITICAL. The client reads [SkinLen], [SkinData], then [Accessory/Padding].
+  // Without this, the client parser is misaligned by 1 byte for the body parts.
   out << write_uint8(0);
 
   // Body Parts
@@ -51,11 +52,6 @@ std::ostream& operator<<(std::ostream& out, const packet_add_snake& p) {
         << write_uint24(static_cast<uint24_t>(ty * 5.0f));
 
     // Then relative coords from Tail -> Head
-    // (Note: Your original code went Tail->Head, verifying if logic remains)
-    // Proto 11 Doc: "Next position in relative coords from prev. element (x - 127) / 2"
-    // Server must write: (val * 2) + 127
-    
-    // Iterating from second-to-last (tail-1) up to head
     for (size_t i = s->parts.size() - 1; i > 0; --i) {
         const Body& curr = s->parts[i];
         const Body& next = s->parts[i-1]; // Moving towards head

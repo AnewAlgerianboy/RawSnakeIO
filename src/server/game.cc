@@ -369,7 +369,8 @@ void GameServer::on_message(connection_hdl hdl, message_ptr ptr) {
   std::stringstream buf(ptr->get_payload(), std::ios_base::in);
 
   in_packet_t packet_type = in_packet_t_angle;
-  buf >> packet_type;
+  // buf >> packet_type;
+  buf.read(reinterpret_cast<char*>(&packet_type), 1);
 
   // session obtain
   const auto ses_i = sessions.find(hdl);
@@ -412,52 +413,78 @@ void GameServer::on_message(connection_hdl hdl, message_ptr ptr) {
         // 1. Parse the incoming data into the Session struct
         // Protocol 14 parsing: [Type][Ver][Skin][NameLen][Name][CustomData]
         {
-            uint8_t proto_ver;
-            buf >> proto_ver; 
-            buf >> ss.skin;
+            // FIX: Use read() instead of >> to prevent skipping "whitespace" bytes (like Skin 32)
+            uint8_t proto_ver = 0;
+            buf.read(reinterpret_cast<char*>(&proto_ver), 1);
             
-            uint8_t name_len;
-            buf >> name_len;
+            buf.read(reinterpret_cast<char*>(&ss.skin), 1);
+            
+            uint8_t name_len = 0;
+            buf.read(reinterpret_cast<char*>(&name_len), 1);
+
             if (name_len > 0) {
+                 // Safety Check: ensure we don't read past the packet end
+                 // (buf.tellg() gives current position, len is total size)
+                 long remaining = len - static_cast<long>(buf.tellg());
+                 if (remaining < 0) remaining = 0;
+                 if (name_len > remaining) name_len = static_cast<uint8_t>(remaining);
+                 
+                 // Cap name length to reasonable size (e.g., 24 chars) to prevent massive spam
+                 if (name_len > 24) name_len = 24;
+
                  std::vector<char> name_buf(name_len);
                  buf.read(name_buf.data(), name_len);
                  ss.name.assign(name_buf.data(), name_len);
+            } else {
+                 ss.name.clear();
             }
+
+            // Sanitize name (remove non-printable characters) to fix console logs
+            ss.name.erase(std::remove_if(ss.name.begin(), ss.name.end(), 
+                [](unsigned char c){ return c < 32 || c > 126; }), ss.name.end());
 
             // Read custom skin data (remainder of packet)
             if (buf.peek() != EOF) {
                 std::string remaining;
-                std::getline(buf, remaining, (char)EOF);
-                ss.custom_skin_data = remaining;
+                // Read strictly to end
+                std::vector<char> rest;
+                char c;
+                while (buf.get(c)) {
+                    rest.push_back(c);
+                }
+                if (!rest.empty()) {
+                    ss.custom_skin_data.assign(rest.begin(), rest.end());
+                }
             }
+
+            // --- CUSTOM LOGGING HERE ---
+            std::stringstream connect_log;
+            connect_log << COLOR_GREEN << "[CONNECT] " << COLOR_RESET
+                        << "Name: '" << ss.name << "' "
+                        << "| Skin ID: " << (int)ss.skin << " "
+                        << "| Custom Skin: " << (ss.custom_skin_data.empty() ? "No" : "Yes");
+            endpoint.get_alog().write(alevel::app, connect_log.str());
+            // ---------------------------
         }
 
         // 2. CHECK IF SNAKE ALREADY EXISTS
         if (ss.snake_id == 0) {
-            // --- MOVED FROM ON_OPEN ---
-            
-            // A. Create Snake
+            // ... (rest of your existing spawn logic) ...
             const auto new_snake_ptr = world.CreateSnake();
-            
-            // B. Apply Skin/Name to the new snake
             new_snake_ptr->name = ss.name;
             new_snake_ptr->skin = ss.skin;
             new_snake_ptr->custom_skin_data = ss.custom_skin_data;
 
-            // C. Register in World and Session
             world.AddSnake(new_snake_ptr);
             ss.snake_id = new_snake_ptr->id;
             connections[new_snake_ptr->id] = hdl;
 
-            // D. Send INIT Packet (The 'a' packet)
             endpoint.send_binary(hdl, init);
 
-            // E. Send Snake Spawn Packet
             broadcast_binary(packet_add_snake(new_snake_ptr.get()));
-            broadcast_binary(packet_move(new_snake_ptr.get())); // Initial pos
+            broadcast_binary(packet_move(new_snake_ptr.get()));
             SendPOVUpdateTo(ses_i, new_snake_ptr.get());
 
-            // F. Introduce other snakes to this client
             for (auto snake_entry : world.GetSnakes()) {
                 if (snake_entry.first != new_snake_ptr->id) {
                     const Snake *s = snake_entry.second.get();
