@@ -7,24 +7,6 @@
 #include "game/math.h"
 
 
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
 // ANSI color codes for terminal output
 #define COLOR_RESET   "\033[0m"
 #define COLOR_RED     "\033[31m"
@@ -366,11 +348,11 @@ void GameServer::on_message(connection_hdl hdl, message_ptr ptr) {
   }
 
   // Log incoming packet
-  std::stringstream log_in;
+/*  std::stringstream log_in;
   log_in << COLOR_CYAN << COLOR_BOLD << "<<< RECV" << COLOR_RESET 
          << COLOR_CYAN << " [" << len << " bytes]" << COLOR_RESET << "\n";
   log_in << "                " << to_hex(ptr->get_payload());
-  endpoint.get_alog().write(alevel::app, log_in.str());
+  endpoint.get_alog().write(alevel::app, log_in.str());*/
 
   // --- FIX 1: Handle Challenge Response (24-byte secret response) ---
   // The client sends a raw 24-byte secret response after receiving '6'.
@@ -487,7 +469,7 @@ void GameServer::on_message(connection_hdl hdl, message_ptr ptr) {
             DoSnake(ss.snake_id, [&ss](Snake *s) {
                 s->name = ss.name;
                 s->skin = ss.skin;
-                s->custom_skin_data = ss.custom_skin_data; // Copy to snake entity
+                s->custom_skin_data = ss.custom_skin_data;
             });
         }
         break;

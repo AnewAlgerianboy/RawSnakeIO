@@ -155,10 +155,6 @@ void World::CheckSnakeBounds(Snake *s) {
       }
     }
   }
-
-  // std::cout << "intersects " << i << ", SectorSeq " <<
-  // s->box.get_sectors_count() << ", snakes/in/s " <<
-  // s->box.get_snakes_in_sectors_count() << std::endl;
 }
 
 void World::Init(WorldConfig in_config) {
