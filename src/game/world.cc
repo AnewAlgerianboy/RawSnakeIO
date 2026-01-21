@@ -6,6 +6,7 @@
 #include <vector>
 
 #include "game/math.h"
+#include "game/bot_names.h" 
 
 Snake::Ptr World::CreateSnake() {
   lastSnakeId++;
@@ -59,6 +60,13 @@ Snake::Ptr World::CreateSnake() {
 Snake::Ptr World::CreateSnakeBot() {
   Snake::Ptr ptr = CreateSnake();
   ptr->bot = true;
+
+  // ASSIGN RANDOM NAME FROM LIST
+  if (!BOT_NAMES.empty()) {
+      int name_idx = NextRandom(static_cast<int>(BOT_NAMES.size()));
+      ptr->name = BOT_NAMES[name_idx];
+  }
+  
   return ptr;
 }
 
