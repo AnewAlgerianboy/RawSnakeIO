@@ -99,6 +99,7 @@ void GameServer::on_timer(error_code const &ec) {
   BroadcastDebug();
   BroadcastUpdates();
   RemoveDeadSnakes();
+  ProcessDelayedDeaths();
 
   // ---------------------------------------------------------
   // Broadcast Leaderboard (Every 2 seconds)
