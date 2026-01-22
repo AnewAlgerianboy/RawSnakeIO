@@ -50,9 +50,7 @@ struct Session {
 class GameServer {
  public:
   GameServer();
-
   int Run(IncomingConfig in_config);
-
   PacketInit BuildInitPacket();
 
   typedef std::unordered_map<snake_id_t, connection_hdl> ConnectionMap;

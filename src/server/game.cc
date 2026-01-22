@@ -198,92 +198,152 @@ void GameServer::BroadcastDebug() {
   }
 }
 
+// ----------------------------------------------------------------------------
+// UPDATED SendFoodUpdate (Hybrid Protocol Support)
+// ----------------------------------------------------------------------------
+void GameServer::SendFoodUpdate(Snake *ptr) {
+  // 1. Handle Eaten Food (Packet 'c' / 'C')
+  if (!ptr->eaten.empty()) {
+    const snake_id_t id = ptr->id;
+
+    for (auto &s : sessions) {
+        if (s.second.snake_id == 0) continue;
+
+        bool is_modern = s.second.is_modern_protocol();
+        
+        for (const Food &f : ptr->eaten) {
+            // NOTE: The C Client expects [SectorX][SectorY][RelX][RelY][EaterID]
+            // The packet_eat_food constructor handles this split.
+            endpoint.send_binary(s.first, packet_eat_food(id, f, is_modern));
+        }
+    }
+    ptr->eaten.clear();
+  }
+
+  // 2. Handle Spawned Food
+  if (!ptr->spawn.empty()) {
+    for (auto &s : sessions) {
+        if (s.second.snake_id == 0) continue;
+        bool is_modern = s.second.is_modern_protocol();
+        for (const Food &f : ptr->spawn) {
+             endpoint.send_binary(s.first, packet_spawn_food(f, is_modern));
+        }
+    }
+    ptr->spawn.clear();
+  }
+}
+
+// ----------------------------------------------------------------------------
+// NEW ProcessDelayedDeaths
+// ----------------------------------------------------------------------------
+
+void GameServer::ProcessDelayedDeaths() {
+    const long now = GetCurrentTime();
+    
+    // Use iterator loop instead of range-based loop
+    for (auto it = sessions.begin(); it != sessions.end(); ++it) {
+        Session &ss = it->second;
+
+        // If death_timestamp is set (>0) and 2 seconds (2000ms) have passed
+        if (ss.death_timestamp > 0 && (now - ss.death_timestamp > 2000)) {
+            
+            // Send the 'v' packet (Game Over)
+            // send_binary requires the iterator 'it'
+            send_binary(it, packet_end(packet_end::status_death));
+            
+            // Reset session state
+            ss.death_timestamp = 0;
+            ss.snake_id = 0; // Back to main menu
+        }
+    }
+}
+
+// ----------------------------------------------------------------------------
+// UPDATED BroadcastUpdates
+// ----------------------------------------------------------------------------
 void GameServer::BroadcastUpdates() {
   for (auto ptr : world.GetChangedSnakes()) {
     const snake_id_t id = ptr->id;
     const uint8_t flags = ptr->update;
 
-    if (flags & change_dead) {
-      continue;
-    }
+    if (flags & change_dead) continue;
 
     if (flags & change_dying) {
-      endpoint.get_alog().write(alevel::app,
-        "Found dying snake " + std::to_string(id));
+      // 1. Notify logs
+      endpoint.get_alog().write(alevel::app, "Snake died: " + std::to_string(id));
 
+      // 2. Handle Human Player Death Logic
       if (!ptr->bot) {
         const auto ses_i = LoadSessionIter(id);
         if (ses_i != sessions.end()) {
-          send_binary(ses_i, packet_end(packet_end::status_death));
+          // DO NOT send 'v' (packet_end) here immediately.
+          // Set the timestamp. on_timer will handle sending 'v' after 2 seconds.
+          ses_i->second.death_timestamp = GetCurrentTime();
         }
       }
 
+      // 3. Spawn Food from body
       ptr->on_dead_food_spawn(&world.GetSectors(), [&]() -> float {
         return world.NextRandomf();
       });
       SendFoodUpdate(ptr);
 
+      // 4. Broadcast Removal to all clients (so visual snake disappears/turns to food)
       broadcast_binary(packet_remove_snake(ptr->id, packet_remove_snake::status_snake_died));
-      broadcast_binary(packet_remove_snake(ptr->id, packet_remove_snake::status_snake_left));
-
+      
+      // 5. Mark logic
       ptr->update |= change_dead;
-
-      if (ptr->bot) {
-        world.GetDead().push_back(ptr->id);
-      }
+      world.GetDead().push_back(ptr->id); // Will be removed from world in RemoveDeadSnakes()
 
       continue;
     }
 
     if (flags) {
+      // Rotation
       if (flags & (change_angle | change_speed)) {
         packet_rotation rot = packet_rotation();
         rot.snakeId = id;
-
         if (flags & change_angle) {
           ptr->update ^= change_angle;
           rot.ang = ptr->angle;
-
           if (flags & change_wangle) {
             ptr->update ^= change_wangle;
             rot.wang = ptr->wangle;
           }
         }
-
         if (flags & change_speed) {
           ptr->update ^= change_speed;
           rot.snakeSpeed = ptr->speed / 32.0f;
         }
-
         broadcast_binary(rot);
       }
 
+      // Position / Growth
       if (flags & change_pos) {
         ptr->update ^= change_pos;
-
-        // increase length
         if (ptr->clientPartsIndex < ptr->parts.size()) {
           broadcast_binary(packet_inc(ptr));
           ptr->clientPartsIndex++;
         } else {
-          // decrease length
           if (ptr->clientPartsIndex > ptr->parts.size()) {
             broadcast_binary(packet_remove_part(ptr));
             ptr->clientPartsIndex--;
           }
-
-          // move
           broadcast_binary(packet_move(ptr));
         }
 
         SendFoodUpdate(ptr);
+        
+        // Update Viewport for Human
         if (!ptr->bot) {
           const auto ses_i = LoadSessionIter(id);
-          SendPOVUpdateTo(ses_i, ptr);
-
-          if (flags & change_fullness) {
-            send_binary(ses_i, packet_fullness(ptr));
-            ptr->update ^= change_fullness;
+          // Only update viewport if not currently dead/waiting for game over
+          if (ses_i != sessions.end() && ses_i->second.death_timestamp == 0) {
+              SendPOVUpdateTo(ses_i, ptr);
+              if (flags & change_fullness) {
+                send_binary(ses_i, packet_fullness(ptr));
+                ptr->update ^= change_fullness;
+              }
           }
         }
       }
@@ -434,25 +494,6 @@ void GameServer::SendPOVUpdateTo(SessionIter ses_i, Snake *ptr) {
       send_binary(ses_i, packet_remove_sector(s_ptr->x, s_ptr->y));
     }
     ptr->vp.old_sectors.clear();
-  }
-}
-
-void GameServer::SendFoodUpdate(Snake *ptr) {
-  if (!ptr->eaten.empty()) {
-    const snake_id_t id = ptr->id;
-    for (const Food &f : ptr->eaten) {
-      // TODO(john.koepi): to those who observers me
-      broadcast_binary(packet_eat_food(id, f));
-    }
-    ptr->eaten.clear();
-  }
-
-  if (!ptr->spawn.empty()) {
-    for (const Food &f : ptr->spawn) {
-      // TODO(john.koepi): to those who observers me
-      broadcast_binary(packet_spawn_food(f));
-    }
-    ptr->spawn.clear();
   }
 }
 
@@ -620,14 +661,20 @@ void GameServer::on_message(connection_hdl hdl, message_ptr ptr) {
 
             endpoint.send_binary(hdl, init);
 
-            broadcast_binary(packet_add_snake(new_snake_ptr.get()));
+            // Manual broadcast to handle version differences
+            for (auto &s : sessions) {
+                bool is_modern = s.second.is_modern_protocol();
+                endpoint.send_binary(s.first, packet_add_snake(new_snake_ptr.get(), is_modern));
+            }
+
             broadcast_binary(packet_move(new_snake_ptr.get()));
             SendPOVUpdateTo(ses_i, new_snake_ptr.get());
 
             for (auto snake_entry : world.GetSnakes()) {
                 if (snake_entry.first != new_snake_ptr->id) {
                     const Snake *s = snake_entry.second.get();
-                    send_binary(ses_i, packet_add_snake(s));
+                    bool is_modern = ss.is_modern_protocol(); 
+                    send_binary(ses_i, packet_add_snake(s, is_modern));
                     send_binary(ses_i, packet_move(s));
                 }
             }
