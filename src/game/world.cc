@@ -61,10 +61,12 @@ Snake::Ptr World::CreateSnakeBot() {
   Snake::Ptr ptr = CreateSnake();
   ptr->bot = true;
 
-  // ASSIGN RANDOM NAME FROM LIST
+  // ASSIGN RANDOM NAME FROM LIST WITH SUFFIX
   if (!BOT_NAMES.empty()) {
       int name_idx = NextRandom(static_cast<int>(BOT_NAMES.size()));
-      ptr->name = BOT_NAMES[name_idx];
+      ptr->name = BOT_NAMES[name_idx] + " (Bot)"; // <--- ADDED SUFFIX
+  } else {
+      ptr->name = "Bot"; // Fallback if list is empty
   }
   
   return ptr;
