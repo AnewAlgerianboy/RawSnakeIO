@@ -1,33 +1,30 @@
 #include "packet/p_snake.h"
 
+// Implementation for ADDING a snake (Spawning)
 std::ostream& operator<<(std::ostream& out, const packet_add_snake& p) {
   out << static_cast<PacketBase>(p);
 
   const Snake* s = p.s;
 
-  // Protocol 11 Header Layout
+  // 1. Header: [ID][Angle][Reserved][WantedAngle][Speed][Fullness][Skin][X][Y]
   out << write_uint16(s->id);
-  out << write_ang24(s->angle); // ehang (3 bytes)
-  out << write_uint8(0);        // Unused 8th byte (always 0, original trace had 0x30 but 0 is safe)
-  out << write_ang24(s->wangle); // wang (3 bytes)
-  out << write_uint16(static_cast<uint16_t>(s->speed * 1000.0f / 32.0f)); // Speed
+  out << write_ang24(s->angle); 
+  out << write_uint8(0);        // Reserved byte (must be 0)
+  out << write_ang24(s->wangle); 
+  out << write_uint16(static_cast<uint16_t>(s->speed * 1000.0f / 32.0f)); 
   out << write_fp24(s->fullness / 100.0f);
   out << write_uint8(s->skin);
   out << write_uint24(s->get_head_x() * 5.0f);
   out << write_uint24(s->get_head_y() * 5.0f);
   
-  // Name
-  // MUST use write_string to ensure the [Length][String] format.
-  // Original trace: 03 31 32 33 (Len: 3, "123")
+  // 2. Name: [Len][String]
   out << write_string(s->name); 
 
-  // Custom Skin Data
-  // Standard format: [Length][Data]
-  // Note: write_string automatically writes the length byte first.
+  // 3. Custom Skin Data: [Len][Data]
   if (s->custom_skin_data.empty()) {
       out << write_uint8(0);
   } else {
-      // Safety clamp for skin data length (max 255)
+      // Safety clamp
       if (s->custom_skin_data.size() > 255) {
           out << write_uint8(255); 
           out.write(s->custom_skin_data.data(), 255);
@@ -36,14 +33,25 @@ std::ostream& operator<<(std::ostream& out, const packet_add_snake& p) {
       }
   }
 
-  // Padding / Accessory ID
-  // This byte is CRITICAL. The client reads [SkinLen], [SkinData], then [Accessory/Padding].
-  // Without this, the client parser is misaligned by 1 byte for the body parts.
-  out << write_uint8(0);
+  // 4. Accessory/Padding Byte
+  // Protocol Logic:
+  // - C Client (Modern) skips this byte if we are not careful, but the source shows it performs a `p++` after skin.
+  // - JS Client (Legacy) expects this byte.
+  // - To be safe for both in a Hybrid server without per-client packet class pointers, sending 0 is the safest default.
+  //   However, if you used the `is_modern` flag in the header, we use it here.
+  
+  if (!p.is_modern) {
+      out << write_uint8(0); 
+  } else {
+      // Even for C client, based on your logs and code, there is often a padding byte expected 
+      // between skin data and body parts.
+      // If the C client crashes, try uncommenting the line below:
+      out << write_uint8(0);
+  }
 
-  // Body Parts
+  // 5. Body Parts
   if (!s->parts.empty()) {
-    // Protocol 11 explicitly sends the TAIL position in absolute coords first
+    // Protocol 11+ sends the TAIL position in absolute coords first
     const Body& tail = s->parts.back();
     float tx = tail.x;
     float ty = tail.y;
@@ -67,9 +75,11 @@ std::ostream& operator<<(std::ostream& out, const packet_add_snake& p) {
   return out;
 }
 
+// Implementation for REMOVING a snake (Death/Despawn)
+// THIS WAS LIKELY MISSING OR BROKEN
 std::ostream& operator<<(std::ostream& out, const packet_remove_snake& p) {
   out << static_cast<PacketBase>(p);
   out << write_uint16(p.snakeId);
-  out << write_uint8(p.status);
+  out << write_uint8(p.status); // 0 = Left range, 1 = Died
   return out;
 }
