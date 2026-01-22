@@ -29,14 +29,19 @@ struct Session {
   snake_id_t snake_id = 0;
   long last_packet_time = 0;
 
+  // New: Track when the player died to delay the 'v' packet
+  long death_timestamp = 0; 
+
   std::string name;
   std::string message;
-
-  // New: Store custom skin data raw bytes
   std::string custom_skin_data;
 
-  uint8_t protocol_version = 0;  // current 8
-  uint8_t skin = 0;              // 0 - 39
+  uint8_t protocol_version = 0;  
+  uint8_t skin = 0;              
+
+  bool is_modern_protocol() const { 
+      return protocol_version >= 25; // C Client is usually 31
+  }
 
   Session() = default;
   Session(snake_id_t id, long now) : snake_id(id), last_packet_time(now) {}

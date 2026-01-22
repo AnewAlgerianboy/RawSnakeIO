@@ -544,75 +544,71 @@ void GameServer::on_message(connection_hdl hdl, message_ptr ptr) {
       send_binary(ses_i, packet_pong());
       break;
 
-    case in_packet_t_start_login: // 'c'
-        // Send Pre-init '6'
-        // The payload is now hardcoded inside the packet_pre_init constructor
+    case in_packet_t_start_login:
         send_binary(ses_i, packet_pre_init()); 
         break;
 
     case in_packet_t_username_skin: // 's'
+    {
         if (len < 3) return;
-        
-        // 1. Parse the incoming data into the Session struct
-        // Protocol 14 parsing: [Type][Ver][Skin][NameLen][Name][CustomData]
-        {
-            // FIX: Use read() instead of >> to prevent skipping "whitespace" bytes (like Skin 32)
-            uint8_t proto_ver = 0;
-            buf.read(reinterpret_cast<char*>(&proto_ver), 1);
-            
-            buf.read(reinterpret_cast<char*>(&ss.skin), 1);
-            
-            uint8_t name_len = 0;
-            buf.read(reinterpret_cast<char*>(&name_len), 1);
+        uint8_t proto_ver = 0;
+        buf.read(reinterpret_cast<char*>(&proto_ver), 1);
+        ss.protocol_version = proto_ver; 
 
-            if (name_len > 0) {
-                 // Safety Check: ensure we don't read past the packet end
-                 // (buf.tellg() gives current position, len is total size)
-                 long remaining = len - static_cast<long>(buf.tellg());
-                 if (remaining < 0) remaining = 0;
-                 if (name_len > remaining) name_len = static_cast<uint8_t>(remaining);
-                 
-                 // Cap name length to reasonable size (e.g., 24 chars) to prevent massive spam
-                 if (name_len > 24) name_len = 24;
-
-                 std::vector<char> name_buf(name_len);
-                 buf.read(name_buf.data(), name_len);
-                 ss.name.assign(name_buf.data(), name_len);
-            } else {
-                 ss.name.clear();
-            }
-
-            // Sanitize name (remove non-printable characters) to fix console logs
-            ss.name.erase(std::remove_if(ss.name.begin(), ss.name.end(), 
-                [](unsigned char c){ return c < 32 || c > 126; }), ss.name.end());
-
-            // Read custom skin data (remainder of packet)
-            if (buf.peek() != EOF) {
-                std::string remaining;
-                // Read strictly to end
-                std::vector<char> rest;
-                char c;
-                while (buf.get(c)) {
-                    rest.push_back(c);
-                }
-                if (!rest.empty()) {
-                    ss.custom_skin_data.assign(rest.begin(), rest.end());
-                }
-            }
-
-            // --- CUSTOM LOGGING HERE ---
-            std::stringstream connect_log;
-            connect_log << COLOR_GREEN << "[CONNECT] " << COLOR_RESET
-                        << "Name: '" << ss.name << "' "
-                        << "| Skin ID: " << (int)ss.skin << " "
-                        << "| Custom Skin: " << (ss.custom_skin_data.empty() ? "No" : "Yes");
-            endpoint.get_alog().write(alevel::app, connect_log.str());
-            // ---------------------------
+        if (ss.is_modern_protocol()) {
+             char dummy[2];
+             buf.read(dummy, 2); // Skip '333'
+             endpoint.get_alog().write(alevel::app, "Detected Modern/C Client");
+        } else {
+             endpoint.get_alog().write(alevel::app, "Detected Legacy/JS Client");
         }
 
-        // 2. CHECK IF SNAKE ALREADY EXISTS
+        buf.read(reinterpret_cast<char*>(&ss.skin), 1);
+        
+        uint8_t name_len = 0;
+        buf.read(reinterpret_cast<char*>(&name_len), 1);
+
+        ss.name.clear();
+        if (name_len > 0) {
+            long remaining = len - static_cast<long>(buf.tellg());
+            if (name_len > remaining) name_len = static_cast<uint8_t>(remaining);
+            if (name_len > 24) name_len = 24;
+            if (name_len > 0) {
+                std::vector<char> name_buf(name_len);
+                buf.read(name_buf.data(), name_len);
+                ss.name.assign(name_buf.data(), name_len);
+            }
+        }
+        
+        // --- FIX FOR SKIN RENDERING ---
+        // Skip [0, 255] padding sent by C client after name
+        if (ss.is_modern_protocol()) {
+             char padding[2];
+             // We use read to advance the buffer position
+             if (len - buf.tellg() >= 2) {
+                 buf.read(padding, 2);
+             }
+        }
+        // ------------------------------
+
+        ss.custom_skin_data.clear();
+        if (buf.peek() != EOF) {
+            long remaining_bytes = len - static_cast<long>(buf.tellg());
+            if (remaining_bytes > 0) {
+                std::vector<char> skin_buf(remaining_bytes);
+                buf.read(skin_buf.data(), remaining_bytes);
+                ss.custom_skin_data.assign(skin_buf.data(), remaining_bytes);
+            }
+        }
+
+        std::stringstream connect_log;
+        connect_log << COLOR_GREEN << "[CONNECT] " << COLOR_RESET
+                    << "Name: '" << ss.name << "' "
+                    << "| Skin ID: " << (int)ss.skin << " "
+                    << "| Custom Skin Size: " << ss.custom_skin_data.size();
+        endpoint.get_alog().write(alevel::app, connect_log.str());
+
         if (ss.snake_id == 0) {
-            // ... (rest of your existing spawn logic) ...
             const auto new_snake_ptr = world.CreateSnake();
             new_snake_ptr->name = ss.name;
             new_snake_ptr->skin = ss.skin;
