@@ -424,40 +424,36 @@ void GameServer::BroadcastMinimap() {
     for (size_t i = 0; i < s->parts.size(); i += 4) {
       const Body& b = s->parts[i];
       
-      // FIX: Direct mapping without offset. b.x/b.y are already absolute world coords (0..43200)
       int mx = static_cast<int>(b.x * scale);
       int my = static_cast<int>(b.y * scale);
 
-      if (mx >= 0 && mx < map_dim && my >= 0 && my < map_dim) {
-        grid[my * map_dim + mx] = 1; // Mark pixel
-      }
+      // Clamp coordinates
+      if (mx < 0) mx = 0;
+      if (mx >= map_dim) mx = map_dim - 1;
+      if (my < 0) my = 0;
+      if (my >= map_dim) my = map_dim - 1;
+
+      grid[my * map_dim + mx] = 1; // Mark pixel
     }
   }
 
   // 3. Compress for Client (RLE-like encoding)
-  // Protocol:
-  // Byte >= 128: skip (value - 128) pixels
-  // Byte < 128: repeat for every bit (from 64-bit to 1-bit)
   int current_skip = 0;
   
   for (size_t i = 0; i < grid.size(); ) {
     if (grid[i] == 0) {
       current_skip++;
-      // Max skip in one byte is 127 (255 - 128 = 127)
       if (current_skip >= 127) {
         map_packet.data.push_back(static_cast<uint8_t>(128 + current_skip));
         current_skip = 0;
       }
       i++;
     } else {
-      // Flush any pending skips
       if (current_skip > 0) {
         map_packet.data.push_back(static_cast<uint8_t>(128 + current_skip));
         current_skip = 0;
       }
       
-      // Encode next 7 pixels into 1 byte (bits 6 down to 0)
-      // Note: "from 64-bit to 1-bit" corresponds to values 64, 32, 16, 8, 4, 2, 1
       uint8_t chunk = 0;
       for (int bit = 0; bit < 7; ++bit) {
         if (i + bit < grid.size()) {
@@ -468,24 +464,33 @@ void GameServer::BroadcastMinimap() {
       }
       
       map_packet.data.push_back(chunk);
-      i += 7; // Advance by 7 pixels
+      i += 7;
     }
   }
   
-  // Flush final skips
   if (current_skip > 0) {
     map_packet.data.push_back(static_cast<uint8_t>(128 + current_skip));
   }
 
-  // 4. Broadcast to all players
   broadcast_binary(map_packet);
 }
 
+// ----------------------------------------------------------------------------
+// UPDATED SendPOVUpdateTo (Hybrid Protocol Support)
+// ----------------------------------------------------------------------------
 void GameServer::SendPOVUpdateTo(SessionIter ses_i, Snake *ptr) {
+  bool is_modern = ses_i->second.is_modern_protocol();
+
   if (!ptr->vp.new_sectors.empty()) {
     for (const Sector *s_ptr : ptr->vp.new_sectors) {
       send_binary(ses_i, packet_add_sector(s_ptr->x, s_ptr->y));
-      send_binary(ses_i, packet_set_food(&s_ptr->food));
+      
+      // HYBRID CHECK
+      if (is_modern) {
+          send_binary(ses_i, packet_set_food_rel(&s_ptr->food));
+      } else {
+          send_binary(ses_i, packet_set_food_abs(&s_ptr->food));
+      }
     }
     ptr->vp.new_sectors.clear();
   }
@@ -512,8 +517,6 @@ void GameServer::on_socket_init(websocketpp::connection_hdl, boost::asio::ip::tc
 }
 
 void GameServer::on_open(connection_hdl hdl) {
-  // Just initialize the session. Do NOT create snake or send Init yet.
-  // snake_id 0 implies not spawned yet.
   sessions[hdl] = Session(0, GetCurrentTime());
 }
 
@@ -524,7 +527,6 @@ void GameServer::on_message(connection_hdl hdl, message_ptr ptr) {
     return;
   }
 
-  // len check
   const size_t len = ptr->get_payload().size();
   if (len > 255) {
     endpoint.get_alog().write(alevel::app,
@@ -532,47 +534,28 @@ void GameServer::on_message(connection_hdl hdl, message_ptr ptr) {
     return;
   }
 
-  // Log incoming packet
-/*  std::stringstream log_in;
-  log_in << COLOR_CYAN << COLOR_BOLD << "<<< RECV" << COLOR_RESET 
-         << COLOR_CYAN << " [" << len << " bytes]" << COLOR_RESET << "\n";
-  log_in << "                " << to_hex(ptr->get_payload());
-  endpoint.get_alog().write(alevel::app, log_in.str());*/
-
-  // --- FIX 1: Handle Challenge Response (24-byte secret response) ---
-  // The client sends a raw 24-byte secret response after receiving '6'.
-  // We must catch this before it falls into the steering logic.
   if (len == 24) {
-      // In a real server, we would validate this against the secret sent in packet '6'.
-      // For now, we simply accept it and wait for the next packet ('s').
       endpoint.get_alog().write(alevel::app, 
           COLOR_YELLOW "    → Challenge response accepted" COLOR_RESET);
       return; 
   }
 
-  // reader
   std::stringstream buf(ptr->get_payload(), std::ios_base::in);
 
   in_packet_t packet_type = in_packet_t_angle;
-  // buf >> packet_type;
   buf.read(reinterpret_cast<char*>(&packet_type), 1);
 
-  // session obtain
   const auto ses_i = sessions.find(hdl);
   if (ses_i == sessions.end()) {
     endpoint.get_alog().write(alevel::app, "No session, skip packet");
     return;
   }
 
-  // last client time manage
   Session &ss = ses_i->second;
 
-  // parsing
-  // Ensure we don't treat 'c' (99) or 's' (115) as steering angles
   if (packet_type <= 250 && len == 1 && 
       packet_type != in_packet_t_start_login && 
       packet_type != in_packet_t_username_skin) {
-    // in_packet_t_angle, [0 - 250]
     const float angle = Math::f_pi * packet_type / 125.0f;
     DoSnake(ss.snake_id, [=](Snake *s) {
       s->wangle = angle;
@@ -686,50 +669,30 @@ void GameServer::on_message(connection_hdl hdl, message_ptr ptr) {
                 s->custom_skin_data = ss.custom_skin_data;
             });
         }
-        break;
+    }
+    break;
 
-    case in_packet_t_rotation: // 252 (New Input)
+    case in_packet_t_rotation: 
         uint8_t rot_val;
-        buf >> rot_val;
-        // 0-127 = Left (Counter-Clockwise)
-        // 128-255 = Right (Clockwise)
-        // The value represents "Virtual Frames".
-        
-        // Simplified Logic mapping to your existing system:
+        buf.read(reinterpret_cast<char*>(&rot_val), 1);
         if (rot_val < 128) {
-            // Turning Left
-            // You might need to adjust your physics engine to accept this specific value 
-            // or map it to your existing "rot_left" logic.
-            endpoint.get_alog().write(alevel::app, "Proto 11: Rotate Left");
-            // Execute existing rotation logic here...
+             // Left
         } else {
-            // Turning Right
-            endpoint.get_alog().write(alevel::app, "Proto 11: Rotate Right");
-            // Execute existing rotation logic here...
+             // Right
         }
         break;
 
     case in_packet_t_victory_message:
-      buf >> packet_type;  // always 118
+      buf >> packet_type;
       buf.str(ss.message);
       break;
 
     case in_packet_t_rot_left:
-      buf >> packet_type;  // vfrb (virtual frames count) [0 - 127] of turning
-                           // into the right direction
-      // snake.eang -= mamu * v * snake.scang * snake.spang)
-      endpoint.get_alog().write(alevel::app,
-          "rotate ccw, snake " + std::to_string(ss.snake_id) + ", vfrb " +
-          std::to_string(packet_type));
+      buf >> packet_type; 
       break;
 
     case in_packet_t_rot_right:
-      buf >> packet_type;  // vfrb (virtual frames count) [0 - 127] of turning
-                           // into the right direction
-      // snake.eang += mamu * v * snake.scang * snake.spang)
-      endpoint.get_alog().write(alevel::app,
-          "rotate cw, snake " + std::to_string(ss.snake_id) + ", vfrb " +
-          std::to_string(packet_type));
+      buf >> packet_type; 
       break;
 
     case in_packet_t_start_acc:

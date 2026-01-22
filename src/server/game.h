@@ -9,9 +9,7 @@
 #include <iomanip>
 
 #include "server/server.h"
-
 #include "game/world.h"
-
 #include "packet/d_all.h"
 #include "packet/p_all.h"
 
@@ -58,7 +56,7 @@ class GameServer {
   typedef SessionMap::iterator SessionIter;
 
  private:
-  void on_socket_init(connection_hdl, boost::asio::ip::tcp::socket &s);  // NOLINT(runtime/references)
+  void on_socket_init(connection_hdl, boost::asio::ip::tcp::socket &s);
   void on_open(connection_hdl hdl);
   void on_message(connection_hdl hdl, message_ptr ptr);
   void on_close(connection_hdl hdl);
@@ -68,26 +66,24 @@ class GameServer {
   void SendFoodUpdate(Snake *ptr);
   void BroadcastDebug();
   void BroadcastUpdates();
-
   void BroadcastLeaderboard();
   void BroadcastMinimap();
+  
+  // New helper to handle delayed death messages
+  void ProcessDelayedDeaths();
 
   long last_leaderboard_time = 0;
   long last_minimap_time = 0;
 
   SessionIter LoadSessionIter(snake_id_t id);
-
   void DoSnake(snake_id_t id, std::function<void(Snake *)> f);
   void RemoveSnake(snake_id_t id);
   void RemoveDeadSnakes();
-
   long GetCurrentTime();
   void NextTick(long last);
-
   void PrintWorldInfo();
 
  private:
-  // Helper for hex dump in templates
   static std::string packet_to_hex(const std::string& data, size_t max_bytes = 32) {
     std::stringstream ss;
     size_t len = std::min(data.size(), max_bytes);
@@ -102,68 +98,18 @@ class GameServer {
   template <typename T>
   void send_binary(SessionMap::iterator s, T packet) {
     const long now = GetCurrentTime();
-    const uint16_t interval =
-        static_cast<uint16_t>(now - s->second.last_packet_time);
+    const uint16_t interval = static_cast<uint16_t>(now - s->second.last_packet_time);
     s->second.last_packet_time = now;
     packet.client_time = interval;
-    
-    // Serialize packet to get data
-    std::stringstream pkt_stream;
-    pkt_stream << packet;
-    std::string pkt_data = pkt_stream.str();
-    
-    // Log outgoing packet  
-    // Packet structure: [time_delta:2 bytes][type:1 byte][data...]
-    unsigned char pkt_type = pkt_data.size() >= 3 ? (unsigned char)pkt_data[2] : 0;
-    std::stringstream log_out;
-    log_out << COLOR_GREEN << COLOR_BOLD << ">>> SEND" << COLOR_RESET
-            << COLOR_GREEN << " [" << pkt_data.size() << " bytes] "
-            << "type='" << (char)pkt_type << "' (0x" 
-            << std::hex << (int)pkt_type << std::dec << ")" 
-            << COLOR_RESET << "\n"
-            << "                " << packet_to_hex(pkt_data);
-    endpoint.get_alog().write(alevel::app, log_out.str());
-    
     endpoint.send_binary(s->first, packet);
   }
 
   template <typename T>
   void broadcast_binary(T packet) {
     const long now = GetCurrentTime();
-    
-    // Serialize once for logging
-    std::stringstream pkt_stream;
-    pkt_stream << packet;
-    std::string pkt_data = pkt_stream.str();
-    
-    // Only log if we have human players (non-empty sessions means someone connected)
-    // and skip frequent movement packets (0x67 'g') to reduce noise
-    bool should_log = !sessions.empty();
-    // Packet structure: [time_delta:2 bytes][type:1 byte][data...]
-    unsigned char pkt_type = pkt_data.size() >= 3 ? (unsigned char)pkt_data[2] : 0;
-    
-    // Skip logging movement packets (0x67 = 'g') as they flood the console
-    if (should_log && pkt_type != 0x67) {
-      std::stringstream log_out;
-      log_out << COLOR_MAGENTA << COLOR_BOLD << ">>> BROADCAST" << COLOR_RESET
-              << COLOR_MAGENTA << " [" << pkt_data.size() << " bytes] "
-              << "type='" << (char)pkt_type << "' (0x" 
-              << std::hex << (int)pkt_type << std::dec << ")" 
-              << COLOR_RESET << "\n"
-              << "                " << packet_to_hex(pkt_data);
-      endpoint.get_alog().write(alevel::app, log_out.str());
-    }
-    
     for (auto &s : sessions) {
-      // FIX: CRITICAL CHECK
-      // If snake_id is 0, the client is still in the menu/handshake phase.
-      // Sending them game data ('g', '3', 'c', etc.) violates the protocol and crashes them.
-      if (s.second.snake_id == 0) {
-        continue;
-      }
-
-      const uint16_t interval =
-          static_cast<uint16_t>(now - s.second.last_packet_time);
+      if (s.second.snake_id == 0) continue;
+      const uint16_t interval = static_cast<uint16_t>(now - s.second.last_packet_time);
       s.second.last_packet_time = now;
       packet.client_time = interval;
       endpoint.send_binary(s.first, packet);
@@ -178,7 +124,6 @@ class GameServer {
   }
 
   WSPPServer endpoint;
-
   WSPPServer::timer_ptr timer;
   long last_time_point;
   static const long timer_interval_ms = 10;
@@ -186,8 +131,6 @@ class GameServer {
   World world;
   PacketInit init;
   IncomingConfig config;
-
-  // TODO(john.koepi): reserve to collections
   SessionMap sessions;
   ConnectionMap connections;
 };
