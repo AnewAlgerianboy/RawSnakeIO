@@ -49,3 +49,5 @@ third_party/slither_client/
 *.py
 
 src/merged_js.txt
+
+*.7z
