@@ -226,41 +226,25 @@ void Snake::InitBoxNewSectors(SectorSeq *ss) {
 }
 
 void Snake::UpdateEatenFood(SectorSeq *ss) {
-  // =========================================================
-  // VANILLA EATING ALGORITHM (Derived from Main.as)
-  // =========================================================
-
   // 1. Get Head Position
   float head_x = get_head_x();
   float head_y = get_head_y();
 
   // 2. Calculate Scale Math
-  // 'sc' is calculated in UpdateSnakeConsts. 
-  // We need sc^1.3 for the radius calculation (variable 'sc13' in client).
   float sc13 = powf(sc, 1.3f);
-  
-  // lsz (Line Size / Width) - Base width is 29.0
   float lsz = 29.0f * sc; 
 
   // 3. Calculate Mouth Position (Projected Forward)
-  // Original AS3: nx = xx + cos(ang) * (0.36 * lsz + 31) * sp / 4.8;
-  
-  // We first convert server speed (int) to client speed (float).
-  // In your config, base speed 185 roughly maps to client speed 5.7. 
-  // The conversion factor is roughly 32.0.
   float client_sp = speed / 32.0f;
-  
-  // Calculate the projection distance
   float forward_dist = (0.36f * lsz + 31.0f) * (client_sp / 4.8f);
-  
-  // Project the mouth point
   float mouth_x = head_x + cosf(angle) * forward_dist;
   float mouth_y = head_y + sinf(angle) * forward_dist;
 
   // 4. Calculate Eat Radius
-  // Original AS3: dcsc = 1600 * sc13; (This is distance squared)
-  // Base radius is sqrt(1600) = 40.0f
-  float eat_radius_sq = 1600.0f * sc13; 
+  // Base is 1600. 
+  // FIX: Multiply by 1.5 to make hitbox larger than visual box. 
+  // This compensates for the loss of precision in the C client's relative coordinates.
+  float eat_radius_sq = 1600.0f * sc13 * 1.5f; 
   float eat_radius = sqrtf(eat_radius_sq);
 
   // =========================================================
