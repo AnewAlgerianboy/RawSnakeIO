@@ -31,23 +31,42 @@ I have manually modified the source code of several dependencies (like `websocke
 
 ## 🛠️ Build Instructions
 
-Since dependencies are modified and included, the build process is self-contained. You still need a C++11 compliant compiler (GCC/Clang) and CMake.
+Since dependencies are modified and included, the build process is self-contained. You still need a C++11 compliant compiler and CMake.
 
-1.  **Clone the repository:**
+### 🐧 Linux (GCC/Clang)
+
+1.  **Install dependencies:**
     ```bash
-    git clone https://github.com/your-username/RawSnakeIO.git
-    cd RawSnakeIO
+    sudo apt-get install libboost-system-dev libboost-thread-dev libboost-program-options-dev cmake build-essential
     ```
 
 2.  **Build:**
     ```bash
-    cmake -DCMAKE_C_COMPILER=/usr/bin/cc -DCMAKE_CXX_COMPILER=/usr/bin/c++ -DCMAKE_BUILD_TYPE=Debug .
-    make
+    cmake -B build -DCMAKE_BUILD_TYPE=Release
+    cmake --build build
     ```
 
 3.  **Run:**
     ```bash
-    ./bin/slither_server --bots 50 --avg_len 50
+    ./build/bin/slither_server --bots 50
+    ```
+
+### 🪟 Windows (MinGW-w64 via MSYS2)
+
+1.  **Setup MSYS2** and install dependencies in the MINGW64 terminal:
+    ```bash
+    pacman -S mingw-w64-x86_64-toolchain mingw-w64-x86_64-cmake mingw-w64-x86_64-boost mingw-w64-x86_64-ninja
+    ```
+
+2.  **Build:**
+    ```bash
+    cmake -G Ninja -B build -DCMAKE_BUILD_TYPE=Release
+    cmake --build build
+    ```
+
+3.  **Run:**
+    ```bash
+    ./build/bin/slither_server.exe --bots 50
     ```
 
 ## 🐛 Known Issues (The Short List)

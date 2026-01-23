@@ -1,90 +1,77 @@
-cmake_minimum_required(VERSION 2.6)
+cmake_minimum_required(VERSION 3.5)
 
-project(slither_server)
+project(slither_server CXX)
 
-message ("** " ${PROJECT_NAME})
+message(STATUS "** Project: ${PROJECT_NAME}")
+
 # Set CMake library search policy
 if (COMMAND cmake_policy)
-    cmake_policy (SET CMP0011 NEW)
-endif ()
+    cmake_policy(SET CMP0011 NEW)
+    if(POLICY CMP0074)
+        cmake_policy(SET CMP0074 NEW) # Boost_ROOT
+    endif()
+endif()
 
-# Include our cmake macros
-set (CMAKE_MODULE_PATH ${CMAKE_MODULE_PATH} ${CMAKE_CURRENT_SOURCE_DIR})
-# include (cmake/cppcheck-target-cmake/FindCPPCHECK)
-# include (cmake/cppcheck-target-cmake/CPPCheck)
-# include (cmake/StyleCheck)
+# Compiler flags
+if(MSVC)
+    add_definitions(-D_WIN32_WINNT=0x0601) # Target Windows 7+
+    set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} /W4 /WX- /EHsc")
+else()
+    set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -Wall -Wextra -Wshadow -pedantic")
+    if(NOT MINGW)
+        set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -Werror")
+    endif()
+    set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -Wnon-virtual-dtor -Wno-unused-parameter -Wno-unused-function")
 
-# Detect clang. Not officially reported by cmake.
-execute_process(COMMAND "${CMAKE_CXX_COMPILER}" "-v" ERROR_VARIABLE CXX_VER_STDERR)
-if ("${CXX_VER_STDERR}" MATCHES ".*clang.*")
-    set (CMAKE_COMPILER_IS_CLANGXX 1)
-endif ()
+    set(CMAKE_CXX_FLAGS_DEBUG "${CMAKE_CXX_FLAGS_DEBUG} -DDEBUG")
+    set(CMAKE_CXX_FLAGS_RELEASE "${CMAKE_CXX_FLAGS_RELEASE} -ffast-math -funroll-loops -O3")
 
-# Default CXX flags
-set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -std=c++11 -Wall -Wextra -Wshadow -Werror -pedantic")
-set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -Wnon-virtual-dtor -Wno-unused-parameter -Wno-unused-function")
-set(CMAKE_CXX_FLAGS_DEBUG "${CMAKE_CXX_FLAGS_DEBUG} -DDEBUG")
-set(CMAKE_CXX_FLAGS_RELEASE "${CMAKE_CXX_FLAGS_RELEASE} -ffast-math -funroll-loops -march=native -O3")
+    # march=native can be problematic in CI environments for generic builds
+    # but we keep it for performance if not cross-compiling
+    if(NOT CMAKE_CROSSCOMPILING AND NOT MINGW)
+        set(CMAKE_CXX_FLAGS_RELEASE "${CMAKE_CXX_FLAGS_RELEASE} -march=native")
+    endif()
+endif()
 
-# for old clang 3.5, 3.6 vs gcc 4.8 includes
-# need for ubuntu 14.04
-# don't need for ubuntu 16.04
-# if (CMAKE_COMPILER_IS_CLANGXX)
-#    set (CMAKE_CXX_FLAGS ${CMAKE_CXX_FLAGS} "-stdlib=libc++")
-# endif ()
+if(MINGW)
+    # MinGW might need some extra definitions for Win32 API
+    add_definitions(-D_WIN32_WINNT=0x0601)
+    # Avoid issues with some boost versions and mingw
+    add_definitions(-DBOOST_ASIO_DISABLE_CONCEPTS)
+endif()
 
 # Source & includes
-file (GLOB_RECURSE SOURCE_FILES src/*.cc)
-file (GLOB_RECURSE HEADER_FILES src/*.h)
-set (FILES ${SOURCE_FILES} ${HEADER_FILES})
+file(GLOB_RECURSE SOURCE_FILES src/*.cc)
+file(GLOB_RECURSE HEADER_FILES src/*.h)
 
-include_directories (src)
-include_directories (third_party/websocketpp)
+include_directories(src)
+include_directories(third_party/websocketpp)
 
 # Dependencies
-set (Boost_FIND_REQUIRED TRUE)
-set (Boost_FIND_QUIETLY TRUE)
-set (Boost_DEBUG FALSE)
-set (Boost_USE_MULTITHREADED TRUE)
-set (Boost_ADDITIONAL_VERSIONS "1.39.0" "1.40.0" "1.41.0" "1.42.0" "1.43.0" "1.44.0" "1.46.1")
+set(Boost_USE_MULTITHREADED ON)
+find_package(Boost 1.39.0 REQUIRED COMPONENTS system thread program_options)
 
-find_package (Boost 1.39.0 REQUIRED COMPONENTS system thread program_options)
-
-if (Boost_FOUND)
-    # Boost is a project wide global dependency.
-    include_directories (${Boost_INCLUDE_DIRS})
-    link_directories (${Boost_LIBRARY_DIRS})
-
-    # Pretty print status
-    message (STATUS "-- Include Directories")
-    foreach (include_dir ${Boost_INCLUDE_DIRS})
-        message (STATUS "       " ${include_dir})
-    endforeach ()
-    message (STATUS "-- Library Directories")
-    foreach (library_dir ${Boost_LIBRARY_DIRS})
-        message (STATUS "       " ${library_dir})
-    endforeach ()
-    message (STATUS "-- Libraries")
-    foreach (boost_lib ${Boost_LIBRARIES})
-        message (STATUS "       " ${boost_lib})
-    endforeach ()
-    message ("")
-else ()
-    message (FATAL_ERROR "Failed to find required dependency: boost")
-endif ()
-
-# find_package(ZLIB)
+if(Boost_FOUND)
+    include_directories(${Boost_INCLUDE_DIRS})
+    link_directories(${Boost_LIBRARY_DIRS})
+    message(STATUS "-- Boost Include: ${Boost_INCLUDE_DIRS}")
+    message(STATUS "-- Boost Libraries: ${Boost_LIBRARIES}")
+else()
+    message(FATAL_ERROR "Failed to find required dependency: Boost")
+endif()
 
 # Build
 add_executable(${PROJECT_NAME} ${SOURCE_FILES})
+target_link_libraries(${PROJECT_NAME} ${Boost_LIBRARIES})
 
-target_link_libraries (${PROJECT_NAME} ${Boost_LIBRARIES})
-# target_link_libraries (${PROJECT_NAME} ${ZLIB_LIBRARIES})
+if(UNIX AND NOT APPLE)
+    target_link_libraries(${PROJECT_NAME} pthread)
+endif()
 
-set_target_properties (${PROJECT_NAME} PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}/bin)
+if(WIN32)
+    # For Windows, we might need ws2_32 and mswsock for asio
+    target_link_libraries(${PROJECT_NAME} ws2_32 mswsock)
+endif()
 
-# CppCheck
-# cppcheck_target_sources (${PROJECT_NAME})
-
-# StyleCheck
-# add_style_check_target (${PROJECT_NAME} "${FILES}")
+# Output directory
+set_target_properties(${PROJECT_NAME} PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin)
