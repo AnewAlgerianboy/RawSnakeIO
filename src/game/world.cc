@@ -1,3 +1,9 @@
+/*
+==================================================
+FILE: world.cc
+RELATIVE PATH: game/world.cc
+==================================================
+*/
 #include "game/world.h"
 
 #include <algorithm>
@@ -8,7 +14,40 @@
 #include "game/math.h"
 #include "game/bot_names.h" 
 
-Snake::Ptr World::CreateSnake() {
+// --- NEW: Safety Check Implementation ---
+bool World::IsLocationSafe(float x, float y, float safety_radius) {
+    int16_t sx = static_cast<int16_t>(x / WorldConfig::sector_size);
+    int16_t sy = static_cast<int16_t>(y / WorldConfig::sector_size);
+    
+    float safe_sq = safety_radius * safety_radius;
+
+    // Check 3x3 sectors around the spawn point
+    for (int j = sy - 1; j <= sy + 1; j++) {
+        for (int i = sx - 1; i <= sx + 1; i++) {
+            // Boundary checks for sectors
+            if (i < 0 || i >= WorldConfig::sector_count_along_edge || 
+                j < 0 || j >= WorldConfig::sector_count_along_edge) continue;
+
+            Sector *sec = sectors.get_sector(i, j);
+
+            // Iterate over all snakes currently in this sector
+            for (const BoundBox *bb : sec->snakes) {
+                const Snake *other = bb->snake;
+                
+                // Check distance to the other snake's head
+                if (Math::dist_sq(x, y, other->get_head_x(), other->get_head_y()) < safe_sq) {
+                    return false; // Too close!
+                }
+
+                // Optional: Check distance to *any* body part if you want to be super safe
+                // but checking the head is usually sufficient for spawning.
+            }
+        }
+    }
+    return true;
+}
+
+Snake::Ptr World::CreateSnake(int start_len) {
   lastSnakeId++;
 
   auto s = std::make_shared<Snake>();
@@ -18,34 +57,81 @@ Snake::Ptr World::CreateSnake() {
   s->speed = Snake::base_move_speed;
   s->fullness = 0;
 
-  float angle = Math::f_2pi * NextRandomf();
-  float dist = 1000.0f + NextRandom(5000);
-  uint16_t x = static_cast<uint16_t>(WorldConfig::game_radius + dist * cosf(angle));
-  uint16_t y = static_cast<uint16_t>(WorldConfig::game_radius + dist * sinf(angle));
-  angle = Math::normalize_angle(angle + Math::f_pi);
-  // const uint16_t half_radius = game_radius / 2;
-  // uint16_t x = game_radius + NextRandom(game_radius) - half_radius;
-  // uint16_t y = game_radius + NextRandom(game_radius) - half_radius;
-  // TODO(john.koepi): reserve snake.parts at least for sizeof(snake) bytes
-  const int len = 1 /* head */ + 2 /* body min = 2 */ +
-    std::max(config.snake_min_length,
-    NextRandom(config.snake_average_length));
+  // --- IMPROVED SPAWN LOGIC ---
+  float angle;
+  float dist;
+  uint16_t x, y;
+  
+  // Try up to 20 times to find a safe spot
+  // If the server is super crowded, we give up and spawn at the last generated point
+  int attempts = 0;
+  bool safe = false;
+  
+  // Buffer from the absolute edge to prevent instant death (1500 units)
+  const float max_spawn_radius = WorldConfig::game_radius - 1500.0f;
+  // Distance to keep away from other snake heads (500 units)
+  const float safety_buffer = 500.0f;
 
+  while (attempts < 20) {
+      angle = Math::f_2pi * NextRandomf();
+      
+      // Random distance from 1000 (avoid dead center) to Max Safe Radius
+      // Using sqrt for uniform area distribution (so we don't clump in the middle)
+      float random_factor = sqrt(NextRandomf()); 
+      dist = 1000.0f + random_factor * (max_spawn_radius - 1000.0f);
+      
+      float fx = WorldConfig::game_radius + dist * cosf(angle);
+      float fy = WorldConfig::game_radius + dist * sinf(angle);
+      
+      if (IsLocationSafe(fx, fy, safety_buffer)) {
+          x = static_cast<uint16_t>(fx);
+          y = static_cast<uint16_t>(fy);
+          safe = true;
+          break;
+      }
+      attempts++;
+  }
+
+  // Fallback: If map is full, just calculate based on last attempt
+  if (!safe) {
+      x = static_cast<uint16_t>(WorldConfig::game_radius + dist * cosf(angle));
+      y = static_cast<uint16_t>(WorldConfig::game_radius + dist * sinf(angle));
+  }
+  
+  // Point snake towards the center of the map initially, 
+  // so they don't immediately drive into the wall
+  float angle_to_center = atan2f(WorldConfig::game_radius - y, WorldConfig::game_radius - x);
+  // Add a little randomness to the angle (-45 to +45 degrees)
+  angle = angle_to_center + (NextRandomf() * 1.5f - 0.75f);
+  
+  // Normalize
+  angle = Math::normalize_angle(angle);
+
+  // -----------------------------
+
+  // Fix ensure spawn length is valid
+  const int len = config.snake_min_length;
+  uint16_t intended_score = (start_len > 0) ? start_len : config.h_snake_start_score;
+  if (intended_score < len) intended_score = len;
+  s->target_score = intended_score;
+
+  // Generate body parts backwards from head
   for (int i = 0; i < len && i < Snake::parts_skip_count + Snake::parts_start_move_count; ++i) {
     s->parts.push_back(Body{1.0f * x, 1.0f * y});
-    x += cosf(angle) * WorldConfig::move_step_distance;
-    y += sinf(angle) * WorldConfig::move_step_distance;
+    // Move "backwards" to place tail
+    x -= cosf(angle) * WorldConfig::move_step_distance;
+    y -= sinf(angle) * WorldConfig::move_step_distance;
   }
 
   for (int i = Snake::parts_skip_count + Snake::parts_start_move_count; i < len; ++i) {
     s->parts.push_back(Body{1.0f * x, 1.0f * y});
-    x += cosf(angle) * Snake::tail_step_distance;
-    y += sinf(angle) * Snake::tail_step_distance;
+    x -= cosf(angle) * Snake::tail_step_distance;
+    y -= sinf(angle) * Snake::tail_step_distance;
   }
 
   s->clientPartsIndex = s->parts.size();
-  s->angle = Math::normalize_angle(angle + Math::f_pi);
-  s->wangle = Math::normalize_angle(angle + Math::f_pi);
+  s->angle = Math::normalize_angle(angle);
+  s->wangle = Math::normalize_angle(angle);
 
   s->sbb = SnakeBoundBox(s->get_new_box());
   s->vp = ViewPort(s->get_new_box());
@@ -58,16 +144,19 @@ Snake::Ptr World::CreateSnake() {
 }
 
 Snake::Ptr World::CreateSnakeBot() {
-  Snake::Ptr ptr = CreateSnake();
+  Snake::Ptr ptr = CreateSnake(config.b_snake_start_score);
   ptr->bot = true;
 
-  // ASSIGN RANDOM NAME FROM LIST WITH SUFFIX
   if (!BOT_NAMES.empty()) {
       int name_idx = NextRandom(static_cast<int>(BOT_NAMES.size()));
-      ptr->name = BOT_NAMES[name_idx] + " (Bot)"; // <--- ADDED SUFFIX
+      // FIX: Appending (Bot) tag here
+      ptr->name = BOT_NAMES[name_idx] + " (Bot)";
   } else {
-      ptr->name = "Bot"; // Fallback if list is empty
+      ptr->name = "Unnamed Bot";
   }
+  
+  // Debug output using cerr (flushes immediately so you see it even if it crashes later)
+  std::cerr << "[WORLD] Created Bot: " << ptr->name << " (ID: " << ptr->id << ")" << std::endl;
   
   return ptr;
 }
@@ -89,7 +178,7 @@ void World::Tick(long dt) {
   if (vfr > 0) {
     const long vfr_time = vfr * WorldConfig::frame_time_ms;
     TickSnakes(vfr_time);
-
+    RegenerateFood();
     ticks -= vfr_time;
     frames += vfr;
   }
@@ -99,7 +188,7 @@ void World::TickSnakes(long dt) {
   for (auto pair : snakes) {
     Snake *const s = pair.second.get();
 
-    if (s->Tick(dt, &sectors)) {
+    if (s->Tick(dt, &sectors, config)) {
       changes.push_back(s);
     }
   }
@@ -111,76 +200,150 @@ void World::TickSnakes(long dt) {
   }
 }
 
+void World::RegenerateFood() {
+    // 1. Calculate Total Probability Weight
+    uint32_t w_near = config.spawn_prob_near_snake;
+    uint32_t w_on   = config.spawn_prob_on_snake;
+    uint32_t w_rand = config.spawn_prob_random;
+    uint32_t total_weight = w_near + w_on + w_rand;
+
+    // Safety check to prevent divide by zero
+    if (total_weight == 0) total_weight = 1;
+
+    for (int i = 0; i < config.food_spawn_rate; i++) {
+        Sector* target_sector = nullptr;
+        
+        // Roll the dice (0 to total_weight - 1)
+        uint32_t roll = NextRandom(total_weight);
+
+        // --- OPTION A: Target an Existing Snake (Near or On) ---
+        // We only do this if the roll is within the snake weights AND there are snakes alive
+        if (roll < (w_near + w_on) && !snakes.empty()) {
+             auto it = snakes.begin();
+             // Select a random snake
+             std::advance(it, NextRandom(snakes.size()));
+             Snake* s = it->second.get();
+             
+             int16_t sx = static_cast<int16_t>(s->get_head_x() / WorldConfig::sector_size);
+             int16_t sy = static_cast<int16_t>(s->get_head_y() / WorldConfig::sector_size);
+             
+             // Sub-selection: Neighbor vs Current
+             if (roll < w_near) {
+                 // 1. Target Neighbor Sector (Near Snake)
+                 // Pick a random offset (-1, 0, or 1)
+                 sx += (NextRandom(3) - 1);
+                 sy += (NextRandom(3) - 1);
+             } 
+             // Else: 2. Target Current Sector (On Snake) -> Keep sx, sy as is
+
+             // Validate Map Bounds
+             if (sx >= 0 && sx < WorldConfig::sector_count_along_edge &&
+                 sy >= 0 && sy < WorldConfig::sector_count_along_edge) {
+                 target_sector = sectors.get_sector(sx, sy);
+             }
+        }
+
+        // --- OPTION B: Random Sector ---
+        // 3. Fallback to random if roll was high OR if targeting failed (e.g., bounds error)
+        if (target_sector == nullptr) {
+            int sec_idx = NextRandom(sectors.size());
+            target_sector = &sectors[sec_idx];
+        }
+        
+        // --- CAPACITY CHECK ---
+        // If this sector is already overfilled, skip this specific spawn attempt.
+        if (target_sector->food.size() >= target_sector->max_food_capacity) {
+            continue; 
+        }
+
+        // Generate position within the chosen sector
+        uint16_t fx = target_sector->x * WorldConfig::sector_size + NextRandom<uint16_t>(WorldConfig::sector_size);
+        uint16_t fy = target_sector->y * WorldConfig::sector_size + NextRandom<uint16_t>(WorldConfig::sector_size);
+        
+        // Ensure food is inside the circular map radius
+        float d_sq = Math::dist_sq(fx, fy, (float)WorldConfig::game_radius, (float)WorldConfig::game_radius);
+        if (d_sq > (WorldConfig::game_radius - 500) * (WorldConfig::game_radius - 500)) continue;
+
+        // Insert the food
+        target_sector->Insert(Food{
+            fx, fy, 
+            static_cast<uint8_t>(1 + NextRandom<uint8_t>(5)), 
+            static_cast<uint8_t>(NextRandom<uint8_t>(29))
+        });
+    }
+}
+
 void World::CheckSnakeBounds(Snake *s) {
   static std::vector<snake_id_t> cs_cache;
   cs_cache.clear();
 
-  // ==========================================
-  // START: Tip of the Head Logic
-  // ==========================================
+  float hx = s->get_head_x();
+  float hy = s->get_head_y();
   
-  // 1. Calculate Geometry
-  float center_x = s->get_head_x();
-  float center_y = s->get_head_y();
-  float angle = s->angle;
-  float body_radius = s->get_snake_body_part_radius();
+  float move_dist = s->speed * WorldConfig::frame_time_ms / 1000.0f;
+  if (move_dist < 5.0f) move_dist = 5.0f;
 
-  // 2. Calculate Tip Coordinates (The "Hurt Point")
-  float tip_x = center_x + cosf(angle) * body_radius;
-  float tip_y = center_y + sinf(angle) * body_radius;
+  float prev_hx = hx - cosf(s->angle) * move_dist;
+  float prev_hy = hy - sinf(s->angle) * move_dist;
 
-  // 3. World bounds check
-  // FIX: Cast game_radius to float to resolve ambiguity
-  if (Math::distance_squared(tip_x, tip_y, 
-                             static_cast<float>(WorldConfig::game_radius), 
-                             static_cast<float>(WorldConfig::game_radius)) >=
+  float body_radius = s->lsz / 2.0f;
+  float tip_x = hx + cosf(s->angle) * body_radius;
+  float tip_y = hy + sinf(s->angle) * body_radius;
+
+  if (Math::dist_sq(tip_x, tip_y, (float)WorldConfig::game_radius, (float)WorldConfig::game_radius) >=
       WorldConfig::death_radius * WorldConfig::death_radius) {
     s->update |= change_dying;
     return;
   }
 
-  // 4. Create the Hitbox
-  // We define the hitbox at the Tip position with a reduced radius (0.2f)
-  BoundBoxPos check(tip_x, tip_y, body_radius * 0.2f);
+  int16_t sx = static_cast<int16_t>(hx / WorldConfig::sector_size);
+  int16_t sy = static_cast<int16_t>(hy / WorldConfig::sector_size);
 
-  // ==========================================
-  // END: Tip of the Head Logic
-  // ==========================================
+  for (int j = sy - 1; j <= sy + 1; j++) {
+    for (int i = sx - 1; i <= sx + 1; i++) {
+      if (i < 0 || i >= WorldConfig::sector_count_along_edge || 
+          j < 0 || j >= WorldConfig::sector_count_along_edge) continue;
 
-  // check bound coverage
-  const int16_t sx = static_cast<int16_t>(check.x / WorldConfig::sector_size);
-  const int16_t sy = static_cast<int16_t>(check.y / WorldConfig::sector_size);
-  static const int16_t width = 1;
+      Sector *sec_ptr = sectors.get_sector(i, j);
 
-  // 3x3 check head coverage
-  static const int16_t map_width_sectors =
-      static_cast<int16_t>(WorldConfig::sector_count_along_edge);
-  for (int16_t j = sy - width; j <= sy + width; j++) {
-    for (int16_t i = sx - width; i <= sx + width; i++) {
-      if (i >= 0 && i < map_width_sectors && j >= 0 && j < map_width_sectors) {
-        Sector *sec_ptr = sectors.get_sector(i, j);
-        // check sector intersects head
-        if (sec_ptr->Intersect(
-            {check.x, check.y, WorldConfig::move_step_distance})) {
-          // check sector snakes
-          for (const BoundBox *bb_ptr : sec_ptr->snakes) {
-            const Snake *s2 = bb_ptr->snake;
-            if (s == s2) {
-              continue;
-            }
+      for (const BoundBox *bb : sec_ptr->snakes) {
+        const Snake *other = bb->snake;
+        
+        if (other == s || (other->update & (change_dying|change_dead))) continue; // Skip dying snakes
+        
+        bool checked = false;
+        for(auto id : cs_cache) if(id == other->id) { checked = true; break; }
+        if(checked) continue;
+        cs_cache.push_back(other->id);
 
-            // check if snakes already checked
-            if (std::find(cs_cache.begin(), cs_cache.end(), s2->id) != cs_cache.end()) {
-              continue;
-            } else {
-              cs_cache.push_back(s2->id);
-            }
+        if (!s->sbb.Intersect(other->sbb)) continue;
 
-            if (s2->Intersect(check)) {
-              s->update |= change_dying;
-              return;
-            }
-          }
+        float hit_r = (s->lsz/2.0f) + (other->lsz/2.0f);
+        float hit_dist_sq = hit_r * hit_r;
+
+        size_t len = other->parts.size();
+        if (len < 2) continue;
+
+        for (size_t k = 0; k < len - 1; ++k) {
+             const Body &b1 = other->parts[k];
+             const Body &b2 = other->parts[k+1];
+
+             if (Math::dist_sq(hx, hy, b1.x, b1.y) < hit_dist_sq) {
+                 s->update |= change_dying;
+                 return;
+             }
+
+             if (Math::check_intersection(prev_hx, prev_hy, hx, hy, 
+                                          b1.x, b1.y, b2.x, b2.y)) {
+                 s->update |= change_dying;
+                 return;
+             }
+        }
+        
+        const Body &last = other->parts.back();
+        if (Math::dist_sq(hx, hy, last.x, last.y) < hit_dist_sq) {
+            s->update |= change_dying;
+            return;
         }
       }
     }
@@ -210,6 +373,11 @@ void World::InitFood() {
                      1.0f * dist / (WorldConfig::sector_count_along_edge *
                                     WorldConfig::sector_count_along_edge);
     const size_t density = static_cast<size_t>(dp * 10);
+    
+    // Set capacity to 2x the initial density, with a minimum of 20
+    s.max_food_capacity = std::max((size_t)20, density * 2); 
+    // ----------------------
+
     for (size_t i = 0; i < density; i++) {
       s.Insert(
           Food{static_cast<uint16_t>(
@@ -234,9 +402,12 @@ void World::RemoveSnake(snake_id_t id) {
 
   auto sn_i = GetSnake(id);
   if (sn_i != snakes.end()) {
+    // Redundant: ~BoundBox handles this now
+    /*
     for (auto sec_ptr : sn_i->second->sbb.sectors) {
       sec_ptr->RemoveSnake(id);
     }
+    */
 
     snakes.erase(id);
   }

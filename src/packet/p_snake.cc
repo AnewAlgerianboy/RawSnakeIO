@@ -1,3 +1,10 @@
+/*
+==================================================
+FILE: p_snake.cc
+RELATIVE PATH: packet/p_snake.cc
+==================================================
+*/
+
 #include "packet/p_snake.h"
 
 // Implementation for ADDING a snake (Spawning)
@@ -24,7 +31,7 @@ std::ostream& operator<<(std::ostream& out, const packet_add_snake& p) {
   if (s->custom_skin_data.empty()) {
       out << write_uint8(0);
   } else {
-      // Safety clamp
+      // Safety clamp to prevent packet corruption
       if (s->custom_skin_data.size() > 255) {
           out << write_uint8(255); 
           out.write(s->custom_skin_data.data(), 255);
@@ -34,24 +41,12 @@ std::ostream& operator<<(std::ostream& out, const packet_add_snake& p) {
   }
 
   // 4. Accessory/Padding Byte
-  // Protocol Logic:
-  // - C Client (Modern) skips this byte if we are not careful, but the source shows it performs a `p++` after skin.
-  // - JS Client (Legacy) expects this byte.
-  // - To be safe for both in a Hybrid server without per-client packet class pointers, sending 0 is the safest default.
-  //   However, if you used the `is_modern` flag in the header, we use it here.
-  
-  if (!p.is_modern) {
-      out << write_uint8(0); 
-  } else {
-      // Even for C client, based on your logs and code, there is often a padding byte expected 
-      // between skin data and body parts.
-      // If the C client crashes, try uncommenting the line below:
-      out << write_uint8(0);
-  }
+  // Most clients expect a padding byte between skin data and body parts
+  out << write_uint8(0);
 
   // 5. Body Parts
   if (!s->parts.empty()) {
-    // Protocol 11+ sends the TAIL position in absolute coords first
+    // Protocol sends the TAIL position in absolute coords first
     const Body& tail = s->parts.back();
     float tx = tail.x;
     float ty = tail.y;
@@ -76,7 +71,6 @@ std::ostream& operator<<(std::ostream& out, const packet_add_snake& p) {
 }
 
 // Implementation for REMOVING a snake (Death/Despawn)
-// THIS WAS LIKELY MISSING OR BROKEN
 std::ostream& operator<<(std::ostream& out, const packet_remove_snake& p) {
   out << static_cast<PacketBase>(p);
   out << write_uint16(p.snakeId);

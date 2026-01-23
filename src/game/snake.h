@@ -1,3 +1,9 @@
+/*
+==================================================
+FILE: snake.h
+RELATIVE PATH: game/snake.h
+==================================================
+*/
 #ifndef SRC_GAME_SNAKE_H_
 #define SRC_GAME_SNAKE_H_
 
@@ -7,11 +13,20 @@
 #include <string>
 #include <vector>
 #include <unordered_map>
-#include <functional> // Fix: Added missing include
+#include <functional> 
 
 #include "game/config.h"
 #include "game/sector.h"
 
+struct FoodEatenData {
+  uint16_t x;
+  uint16_t y;
+  uint8_t size;
+  uint8_t color;
+};
+
+
+// ... Enums ...
 enum snake_changes_t : uint8_t {
   change_pos = 1,
   change_angle = 1 << 1,
@@ -23,23 +38,11 @@ enum snake_changes_t : uint8_t {
 };
 
 struct Body {
-  float x;
-  float y;
-
-  inline void From(const Body &p) {
-    x = p.x;
-    y = p.y;
-  }
-
-  inline void Offset(float dx, float dy) {
-    x += dx;
-    y += dy;
-  }
-
+  float x; float y;
+  inline void From(const Body &p) { x = p.x; y = p.y; }
+  inline void Offset(float dx, float dy) { x += dx; y += dy; }
   inline float DistanceSquared(float dx, float dy) const {
-    const float a = x - dx;
-    const float b = y - dy;
-    return a * a + b * b;
+    const float a = x - dx; const float b = y - dy; return a * a + b * b;
   }
 };
 
@@ -51,33 +54,40 @@ class Snake : public std::enable_shared_from_this<Snake> {
   typedef std::shared_ptr<Snake> Ptr;
 
   snake_id_t id;
-
   uint8_t skin;
   uint8_t update;
   bool acceleration;
   bool bot;
 
+  // --- NEW FLAG ---
+  bool newly_spawned = true; 
+  // ----------------
+
   std::string name;
   std::string custom_skin_data;
-
-  // pixels / seconds, base ~185 [px/s]
   uint16_t speed;
-
   float angle;
   float wangle;
-
-  // 0 - 100, 0 - hungry, 100 - full
   uint16_t fullness;
+  uint16_t target_score = 0; // Target score to grow to (spawn animation)
 
   SnakeBoundBox sbb;
   ViewPort vp;
   BodySeq parts;
-  FoodSeq eaten;
+  std::vector<FoodEatenData> eaten;
   FoodSeq spawn;
   size_t clientPartsIndex;
 
-  bool Tick(long dt, SectorSeq *ss);
-  void TickAI(long frames);
+  // Physics Cache
+  float sc13 = 1.0f; 
+  float lsz = 29.0f; 
+
+  // Bot State
+  float bot_target_x = 0;
+  float bot_target_y = 0;
+
+  bool Tick(long dt, SectorSeq *ss, const WorldConfig &config);
+  void TickAI(long frames, SectorSeq *ss);
   void UpdateBoxCenter();
   void UpdateBoxRadius();
   void UpdateSnakeConsts();
@@ -85,10 +95,9 @@ class Snake : public std::enable_shared_from_this<Snake> {
   void UpdateEatenFood(SectorSeq *ss);
 
   bool Intersect(BoundBoxPos foe) const;
-  bool Intersect(BoundBoxPos foe, BodySeqCIter prev, BodySeqCIter iter, BodySeqCIter end) const;
 
   void IncreaseSnake(uint16_t volume);
-  void DecreaseSnake(uint16_t volume);
+  void DecreaseSnake(uint16_t volume, uint8_t drop_size);
   void SpawnFood(Food f);
 
   void on_dead_food_spawn(SectorSeq *ss, std::function<float()> next_randomf);
@@ -107,48 +116,39 @@ class Snake : public std::enable_shared_from_this<Snake> {
   std::shared_ptr<Snake> get_ptr();
   BoundBox get_new_box() const;
 
-  // VANILLA CONSTANTS (Extracted from Main.as)
+  // Constants
   static constexpr float spangdv = 4.8f;
-  
-  // Base Speed (5.39 client units -> ~172 server units)
   static constexpr float nsp1 = 5.39f; 
   static constexpr float nsp2 = 0.4f;
-  
-  // Boost Speed (14.0 client units -> ~448 server units)
   static constexpr float nsp3 = 14.0f; 
-
-  // Server speeds (approximate int conversions: client_val * 32)
   static const uint16_t base_move_speed = 172; 
   static const uint16_t boost_speed = 448;     
   static const uint16_t speed_acceleration = 1000;
-
   static constexpr float snake_angular_speed = 4.125f; 
-  static constexpr float prey_angular_speed = 3.5f;    
+  static constexpr float prey_angular_speed = 3.625f;    
   static constexpr float snake_tail_k = 0.43f; 
   
   static const int parts_skip_count = 3;
   static const int parts_start_move_count = 4;
-  static constexpr float tail_step_distance = 24.0f;  // tail step eval for step dist = 42, k = 0.43
-  static constexpr float rot_step_angle = 1.0f * WorldConfig::move_step_distance /
-    boost_speed * snake_angular_speed;  // radians step per max acc resolution time
+  static constexpr float tail_step_distance = 24.0f;
+  static constexpr float rot_step_angle = 1.0f * WorldConfig::move_step_distance / boost_speed * snake_angular_speed; 
   static const long rot_step_interval = static_cast<long>(1000.0f * rot_step_angle / snake_angular_speed);
-  static const long ai_step_interval = 1000;
+  static const long ai_step_interval = 250; 
 
  private:
   long mov_ticks = 0;
   long rot_ticks = 0;
   long ai_ticks = 0;
 
+  void BotFindFood(SectorSeq *ss);
+  bool BotCheckCollision(SectorSeq *ss, float look_ahead_dist, float &out_avoid_ang);
+
  private:
-  float gsc = 0.0f;  // snake scale 0.5f + 0.4f / fmaxf(1.0f, 1.0f * (parts.size() - 1 + 16) / 36.0f)
-  float sc = 0.0f;  // 106th length on snake, min 1, start from 6. Math.min(6, 1 + (f.sct - 2) / 106)
-  float scang = 0.0f;  // .13 + .87 * Math.pow((7 - f.sc) / 6, 2)
-  float ssp = 0.0f;    // nsp1 + nsp2 * f.sc;
-  float fsp = 0.0f;    // f.ssp + .1;
-  // snake body part radius, in screen coords it is:
-  // - gsc * sbpr * 52 / 32 inner r, and
-  // - gsc * sbpr * 62 / 32 for outer r.
-  // thus, for sbpr 14.5, inner 21.20, outer 25.28
+  float gsc = 0.0f;
+  float sc = 0.0f;
+  float scang = 0.0f;
+  float ssp = 0.0f;
+  float fsp = 0.0f;
   float sbpr = 0.0f;
 };
 

@@ -69,15 +69,16 @@ struct packet_add_food : public PacketBase {
 // 4. Eat Food (Packet 'c')
 // ==========================================================
 struct packet_eat_food : public PacketBase {
-  packet_eat_food() : PacketBase(packet_t_eat_food) {}
-  
-  // Added is_modern flag to constructor
-  packet_eat_food(uint16_t id, Food f, bool modern)
-      : PacketBase(packet_t_eat_food), m_food(f), snakeId(id), is_modern(modern) {}
+  // Update constructor: 
+  // If version >= 20 (C Client is v31), use '<' (rel).
+  // If version < 20 (JS Client is v14), use 'c' (abs).
+  packet_eat_food(uint16_t id, Food f, uint8_t ver)
+      : PacketBase(ver >= 20 ? packet_t_eat_food_rel : packet_t_eat_food), 
+        m_food(f), snakeId(id), protocol_version(ver) {}
 
   Food m_food;
   uint16_t snakeId = 0;
-  bool is_modern = false;
+  uint8_t protocol_version = 0;
 
   size_t get_size() const noexcept { return 3 + 6; }
 };

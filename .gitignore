@@ -51,3 +51,5 @@ third_party/slither_client/
 src/merged_js.txt
 
 *.7z
+
+src/run.sh

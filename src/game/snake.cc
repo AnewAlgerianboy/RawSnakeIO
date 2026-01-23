@@ -1,30 +1,35 @@
 #include "game/snake.h"
-
 #include <iostream>
 #include <array>
-
+#include <algorithm> // For min/max
 #include "game/math.h"
 
-bool Snake::Tick(long dt, SectorSeq *ss) {
+// ----------------------------------------------------------------------
+// MAIN TICK LOOP
+// ----------------------------------------------------------------------
+
+bool Snake::Tick(long dt, SectorSeq *ss, const WorldConfig &config) {
   uint8_t changes = 0;
 
   if (update & (change_dying | change_dead)) {
     return false;
   }
 
+  // --- AI LOGIC ---
   if (bot) {
     ai_ticks += dt;
     if (ai_ticks > ai_step_interval) {
       const long frames = ai_ticks / ai_step_interval;
       const long frames_ticks = frames * ai_step_interval;
 
-      TickAI(frames);
+      // Pass the sectors to the AI so it can see food/enemies
+      TickAI(frames, ss);
 
       ai_ticks -= frames_ticks;
     }
   }
 
-  // rotation
+  // --- ROTATION LOGIC ---
   if (angle != wangle) {
     rot_ticks += dt;
     if (rot_ticks >= rot_step_interval) {
@@ -50,7 +55,7 @@ bool Snake::Tick(long dt, SectorSeq *ss) {
     }
   }
 
-  // movement
+  // --- MOVEMENT LOGIC ---
   mov_ticks += dt;
   const long mov_frame_interval = 1000 * WorldConfig::move_step_distance / speed;
   if (mov_ticks >= mov_frame_interval) {
@@ -107,8 +112,6 @@ bool Snake::Tick(long dt, SectorSeq *ss) {
       pt.From(prev);
       pt.Offset(snake_tail_k * (last.x - pt.x), snake_tail_k * (last.y - pt.y));
 
-      // as far as having step dist = 42, k = 0.43, sec. size = 300, this could
-      // be 300 / 24.0f, with radius 150
       static const size_t tail_step =
           static_cast<size_t>(WorldConfig::sector_size / tail_step_distance);
       if (j + tail_step >= i) {
@@ -134,14 +137,22 @@ bool Snake::Tick(long dt, SectorSeq *ss) {
     if (!bot) {
       vp.UpdateBoxOldSectors();
     }
+    
+    // Check for food
     UpdateEatenFood(ss);
 
     // update speed
     if (acceleration) {
-      if (parts.size() <= 3) {
+      // Check if we can afford to boost
+      // Can only boost if size > start_score (or min_length if start_score is small)
+      // Use target_score as the threshold (which is set to start_score)
+      uint16_t threshold = target_score > 0 ? target_score : 10;
+      
+      // Allow boosting only if we are above the threshold
+      if (parts.size() <= threshold && fullness == 0) {
         acceleration = false;
       } else {
-        DecreaseSnake(33);
+        DecreaseSnake(config.boost_cost, config.boost_drop_size);
       }
     }
 
@@ -170,22 +181,185 @@ bool Snake::Tick(long dt, SectorSeq *ss) {
 
 std::shared_ptr<Snake> Snake::get_ptr() { return shared_from_this(); }
 
+// ----------------------------------------------------------------------
+// AI / BOT LOGIC
+// ----------------------------------------------------------------------
+
+// 1. Find Food (Scans 5x5 sectors)
+void Snake::BotFindFood(SectorSeq *ss) {
+    float hx = get_head_x();
+    float hy = get_head_y();
+    
+    float best_x = (float)WorldConfig::game_radius;
+    float best_y = (float)WorldConfig::game_radius;
+    float max_score = -1.0f;
+
+    int16_t center_sx = static_cast<int16_t>(hx / WorldConfig::sector_size);
+    int16_t center_sy = static_cast<int16_t>(hy / WorldConfig::sector_size);
+
+    // Calculate minimum turning radius based on speed
+    // This prevents the "Spinning" behavior.
+    // If food is inside this radius and requires a hard turn, ignore it.
+    float turn_radius = (speed * 0.033f) / snake_angular_speed; 
+    float min_safe_dist_sq = turn_radius * turn_radius;
+
+    for (int16_t sy = center_sy - 2; sy <= center_sy + 2; ++sy) {
+        for (int16_t sx = center_sx - 2; sx <= center_sx + 2; ++sx) {
+            if (sx < 0 || sx >= WorldConfig::sector_count_along_edge ||
+                sy < 0 || sy >= WorldConfig::sector_count_along_edge) continue;
+
+            Sector *sec = ss->get_sector(sx, sy);
+            
+            for (const Food &f : sec->food) {
+                float dist_sq = Math::dist_sq(hx, hy, f.x, f.y);
+                
+                // ---------------------------------------------------------
+                // FIX 2: Prevent Spinning
+                // ---------------------------------------------------------
+                // If food is too close...
+                if (dist_sq < min_safe_dist_sq) {
+                    // Check angle difference
+                    float ang_to_food = atan2f(f.y - hy, f.x - hx);
+                    float angle_diff = fabs(Math::normalize_angle(ang_to_food - angle));
+                    
+                    // If we have to turn more than 45 degrees (PI/4) to hit something 
+                    // that is inside our turn radius, we will orbit it forever.
+                    // Ignore it so we straighten out and loop back later.
+                    if (angle_diff > (Math::f_pi / 4.0f)) {
+                        continue; 
+                    }
+                }
+                // ---------------------------------------------------------
+
+                float score = (f.size * f.size) / (dist_sq + 1.0f); // +1 to avoid div0
+
+                if (score > max_score) {
+                    max_score = score;
+                    best_x = f.x;
+                    best_y = f.y;
+                }
+            }
+        }
+    }
+
+    bot_target_x = best_x;
+    bot_target_y = best_y;
+    
+    // Only boost if the food is worth it AND it's reasonably far away to control the speed
+    if (fullness > 30 && max_score > 0.05f) {
+        acceleration = true;
+    } else {
+        acceleration = false;
+    }
+}
+
+// 2. Check Collision (Projects whisker)
+bool Snake::BotCheckCollision(SectorSeq *ss, float look_ahead_dist, float &out_avoid_ang) {
+    float hx = get_head_x();
+    float hy = get_head_y();
+    
+    // Look ahead point
+    float whisker_x = hx + cosf(angle) * look_ahead_dist;
+    float whisker_y = hy + sinf(angle) * look_ahead_dist;
+
+    // A. Check World Map Bounds
+    float gr = (float)WorldConfig::game_radius;
+    if (Math::dist_sq(whisker_x, whisker_y, gr, gr) >= WorldConfig::death_radius * WorldConfig::death_radius) {
+        // Turn towards center
+        out_avoid_ang = atan2f(gr - hy, gr - hx);
+        return true;
+    }
+
+    // B. Check Snake Collisions
+    int16_t sx = static_cast<int16_t>(whisker_x / WorldConfig::sector_size);
+    int16_t sy = static_cast<int16_t>(whisker_y / WorldConfig::sector_size);
+    
+    // Check 3x3 around whisker tip
+    for (int j = sy - 1; j <= sy + 1; j++) {
+        for (int i = sx - 1; i <= sx + 1; i++) {
+            if (i < 0 || i >= WorldConfig::sector_count_along_edge || 
+                j < 0 || j >= WorldConfig::sector_count_along_edge) continue;
+
+            Sector *sec = ss->get_sector(i, j);
+
+            for (const BoundBox *bb : sec->snakes) {
+                const Snake *other = bb->snake;
+                if (other == this) continue;
+
+                // Optimization: Bounding box check first
+                if (fabs(whisker_x - other->sbb.x) > other->sbb.r + 50) continue;
+                if (fabs(whisker_y - other->sbb.y) > other->sbb.r + 50) continue;
+
+                // Check Body Parts (Simplified Circle Check for speed)
+                float collision_dist_sq = (sbpr + other->sbpr + 40.0f); // Buffer 40 units
+                collision_dist_sq *= collision_dist_sq;
+
+                for (const Body &b : other->parts) {
+                    if (Math::dist_sq(whisker_x, whisker_y, b.x, b.y) < collision_dist_sq) {
+                        
+                        // Collision detected! Decide turn direction.
+                        float ang_to_obs = atan2f(b.y - hy, b.x - hx);
+                        float rel_ang = Math::normalize_angle(ang_to_obs - angle);
+
+                        // If obstacle is to our left, turn right. Else turn left.
+                        if (rel_ang > 0) {
+                            out_avoid_ang = angle - (Math::f_pi / 1.5f); 
+                        } else {
+                            out_avoid_ang = angle + (Math::f_pi / 1.5f); 
+                        }
+                        
+                        return true;
+                    }
+                }
+            }
+        }
+    }
+
+    return false;
+}
+
+// 3. AI Main Logic
+void Snake::TickAI(long frames, SectorSeq *ss) {
+    // 1. Find Food Target (Goal)
+    BotFindFood(ss);
+
+    // 2. Default Wanted Angle: Towards Food
+    float target_ang = atan2f(bot_target_y - get_head_y(), bot_target_x - get_head_x());
+
+    // 3. Collision Avoidance (Override)
+    // Look ahead 3x the snake width + some speed factor
+    float look_ahead = (lsz * 4.0f) + (speed * 0.4f); 
+    float avoid_ang = 0;
+
+    if (BotCheckCollision(ss, look_ahead, avoid_ang)) {
+        target_ang = avoid_ang;
+        acceleration = false; // Stop boosting if in danger
+    }
+
+    // 4. Set Rotation
+    wangle = Math::normalize_angle(target_ang);
+    update |= change_wangle;
+}
+
+// ----------------------------------------------------------------------
+// STANDARD SNAKE FUNCTIONS
+// ----------------------------------------------------------------------
+
+BoundBox Snake::get_new_box() const {
+  return {{get_head_x(), get_head_y(), 0}, id, this, {}};
+}
+
 void Snake::UpdateBoxCenter() {
   float x = 0.0f;
   float y = 0.0f;
-
-  // calculate center mass
   for (const Body &p : parts) {
     x += p.x;
     y += p.y;
   }
-
   x /= parts.size();
   y /= parts.size();
-
   sbb.x = x;
   sbb.y = y;
-
   vp.x = get_head_x();
   vp.y = get_head_y();
 }
@@ -201,8 +375,33 @@ void Snake::UpdateBoxRadius() {
 
   // reserve 1 step ahead of the snake radius
   sbb.r = (d + WorldConfig::move_step_distance) / 2.0f;
-
   vp.r = WorldConfig::sector_diag_size * 3.0f;
+}
+
+// UPDATED: AS3 Physics Constants
+void Snake::UpdateSnakeConsts() {
+  float sct = (float)parts.size();
+  
+  // Client: sc = Math.min(6, 1 + (sct - 2) / 106);
+  sc = fminf(6.0f, 1.0f + (sct - 2.0f) / 106.0f);
+
+  // Client: sc13 = Math.pow(sc, 1.3);
+  sc13 = powf(sc, 1.3f);
+  
+  // Client: lsz = 29 * sc;
+  lsz = 29.0f * sc;
+
+  // gsc calculation
+  gsc = 0.5f + 0.4f / fmaxf(1.0f, (sct + 16.0f) / 36.0f);
+
+  // scang calculation
+  const float scang_x = (7.0f - sc) / 6.0f;
+  scang = 0.13f + 0.87f * scang_x * scang_x;
+
+  ssp = nsp1 + nsp2 * sc;
+  fsp = ssp + 0.1f;
+
+  sbpr = lsz * 0.5f; 
 }
 
 void Snake::InitBoxNewSectors(SectorSeq *ss) {
@@ -225,173 +424,65 @@ void Snake::InitBoxNewSectors(SectorSeq *ss) {
   }
 }
 
+// UPDATED: 3x3 Sector Scan for Food
 void Snake::UpdateEatenFood(SectorSeq *ss) {
-  // 1. Get Head Position
   float head_x = get_head_x();
   float head_y = get_head_y();
 
-  // 2. Calculate Scale Math
-  float sc13 = powf(sc, 1.3f);
-  float lsz = 29.0f * sc; 
+  // Project mouth position forward based on speed and size
+  float client_sp = speed / 32.0f; // Approx conversion
+  float dist_offset = (0.36f * lsz + 31.0f) * (client_sp / 4.8f);
 
-  // 3. Calculate Mouth Position (Projected Forward)
-  float client_sp = speed / 32.0f;
-  float forward_dist = (0.36f * lsz + 31.0f) * (client_sp / 4.8f);
-  float mouth_x = head_x + cosf(angle) * forward_dist;
-  float mouth_y = head_y + sinf(angle) * forward_dist;
+  float mouth_x = head_x + cosf(angle) * dist_offset;
+  float mouth_y = head_y + sinf(angle) * dist_offset;
 
-  // 4. Calculate Eat Radius
-  // Base is 1600. 
-  // FIX: Multiply by 1.5 to make hitbox larger than visual box. 
-  // This compensates for the loss of precision in the C client's relative coordinates.
-  float eat_radius_sq = 1600.0f * sc13 * 1.5f; 
-  float eat_radius = sqrtf(eat_radius_sq);
+  // Calculate Eat Radius Squared (AS3: dcsc = 1600 * sc13)
+  // FIX: Increased radius slightly to ensure food is consumed reliably
+  float eat_dist_sq = 2000.0f * sc13;
+  float search_r = sqrtf(eat_dist_sq) + 40.0f; 
 
-  // =========================================================
-  // SECTOR SEARCH
-  // =========================================================
+  int16_t center_sx = static_cast<int16_t>(mouth_x / WorldConfig::sector_size);
+  int16_t center_sy = static_cast<int16_t>(mouth_y / WorldConfig::sector_size);
 
-  // Convert float mouth coords to sector indices
-  const int16_t sx = static_cast<int16_t>(mouth_x / WorldConfig::sector_size);
-  const int16_t sy = static_cast<int16_t>(mouth_y / WorldConfig::sector_size);
+  // Scan 3x3 Neighbors
+  for (int16_t sy = center_sy - 1; sy <= center_sy + 1; ++sy) {
+    for (int16_t sx = center_sx - 1; sx <= center_sx + 1; ++sx) {
+        
+        if (sx < 0 || sx >= WorldConfig::sector_count_along_edge ||
+            sy < 0 || sy >= WorldConfig::sector_count_along_edge) continue;
 
-  // Boundary checks
-  if (sx < 0 || sx >= WorldConfig::sector_count_along_edge ||
-      sy < 0 || sy >= WorldConfig::sector_count_along_edge) {
-      return;
-  }
-
-  Sector *sec = ss->get_sector(sx, sy);
-  
-  // Optimization: Find food closest to our mouth X coordinate
-  auto begin = sec->food.begin();
-  auto i = sec->FindClosestFood(static_cast<uint16_t>(mouth_x));
-
-  // 1. Check Backward (Left in vector)
-  auto left = i - 1;
-  while (left >= begin) {
-      float dx = left->x - mouth_x;
-      
-      // Optimization: if X distance squared > eat_radius_sq, stop.
-      // (Since list is sorted by X, we can break early)
-      if (dx * dx > eat_radius_sq) { 
-          // Check sign to ensure we only break if we are truly out of range to the left
-          if (dx < -eat_radius) break; 
-      }
-
-      // Exact Distance Check
-      if (Math::distance_squared(static_cast<float>(left->x), static_cast<float>(left->y), mouth_x, mouth_y) <= eat_radius_sq) {
-          on_food_eaten(*left);
-          sec->Remove(left);
-          i--; // Adjust iterator because elements shifted
-      }
-      left--;
-  }
-
-  // 2. Check Forward (Right in vector)
-  auto end = sec->food.end();
-  while (i < end) {
-      float dx = i->x - mouth_x;
-      
-      if (dx * dx > eat_radius_sq) {
-          if (dx > eat_radius) break;
-      }
-
-      if (Math::distance_squared(static_cast<float>(i->x), static_cast<float>(i->y), mouth_x, mouth_y) <= eat_radius_sq) {
-          on_food_eaten(*i);
-          sec->Remove(i);
-          end--; // Array size decreased
-          // Don't increment 'i' because next element slid into this slot
-      } else {
-          i++;
-      }
-  }
-}
-
-BoundBox Snake::get_new_box() const {
-  return {{get_head_x(), get_head_y(), 0}, id, this, {}};
-}
-
-void Snake::TickAI(long frames) {
-  for (auto i = 0; i < frames; i++) {
-    // 1. calc angle of radius vector
-    float ai_angle = atan2f(get_head_y() - WorldConfig::game_radius,
-                            get_head_x() - WorldConfig::game_radius);
-    // 2. add pi_2
-    ai_angle = Math::normalize_angle(ai_angle + Math::f_pi / 2.0f);
-    // 3. set
-    if (fabsf(wangle - ai_angle) > 0.01f) {
-      wangle = ai_angle;
-      update |= change_wangle;
+        Sector *sec = ss->get_sector(sx, sy);
+        
+        auto it = sec->food.begin();
+        while (it != sec->food.end()) {
+            // Fast Bounding Box Check
+            if (fabs(it->x - mouth_x) < search_r && fabs(it->y - mouth_y) < search_r) {
+                // Exact Distance Check
+                if (Math::dist_sq(it->x, it->y, mouth_x, mouth_y) < eat_dist_sq) {
+                    on_food_eaten(*it);
+                    it = sec->food.erase(it);
+                    continue; 
+                }
+            }
+            ++it;
+        }
     }
   }
 }
 
-bool Snake::Intersect(BoundBoxPos foe, BodySeqCIter prev, BodySeqCIter iter, BodySeqCIter end) const {
-  while (iter != end) {
-    // weak body part check
-    // TODO(john.koepi): reduce this whole thing to middle circle check
-    if (Math::intersect_circle(iter->x, iter->y, foe.x, foe.y, WorldConfig::move_step_distance * 2)) {
-      const float r = foe.r + get_snake_body_part_radius();
-
-      // check actual snake body part
-      if (Math::intersect_circle(iter->x, iter->y, foe.x, foe.y, r) ||
-          Math::intersect_circle(prev->x, prev->y, foe.x, foe.y, r) ||
-          Math::intersect_circle(iter->x + (prev->x - iter->x) / 2.0f,
-                                 iter->y + (prev->y - iter->y) / 2.0f, foe.x, foe.y, r)) {
-        return true;
-      }
-    }
-
-    ++prev;
-    ++iter;
-  }
-
-  return false;
-}
-
+// Legacy Intersect (Required by World::CheckSnakeBounds logic for optimization)
+// Actual collision logic is in World::CheckSnakeBounds
 bool Snake::Intersect(BoundBoxPos foe) const {
-  static const size_t head_size = 8;
-  static const size_t tail_step = static_cast<size_t>(WorldConfig::sector_size / tail_step_distance);
-  static const size_t tail_step_half = tail_step / 2;
-  const size_t len = parts.size();
-
-  if (len <= head_size + tail_step) {
-    return Intersect(foe, parts.begin(), parts.begin() + 1, parts.end());
-  } else {
-    // calculate bb radius, len eval for step dist = 42, k = 0.43
-    // parts ..  1  ..  2  ..  3  ..  4  ..  5  ..  6  ..  7  .. tail by 24.0f
-    // head center will be i = 3, len [0 .. 3] = 42 * 3 = 126, len [3 .. 7] =
-    // 136.9, both < sector_size / 2 = 150
-    auto head = parts[3];
-    if (Math::intersect_circle(head.x, head.y, foe.x, foe.y, WorldConfig::sector_size / 2)) {
-      if (Intersect(foe, parts.begin(), parts.begin() + 1, parts.begin() + 9)) {
-        return true;
-      }
-    }
-
-    // first tail sector center will be... skip 8 + tail_step / 2
-    auto end = parts.end();
-    for (auto i = parts.begin() + 7 + tail_step_half; i < end; i += tail_step) {
-      if (Math::intersect_circle(i->x, i->y, foe.x, foe.y, WorldConfig::sector_size / 2)) {
-        auto start = i - tail_step_half;
-        auto last = i + tail_step_half;
-        if (last > end) {
-          last = end;
-        }
-        if (Intersect(foe, start, start + 1, last)) {
-          return true;
-        }
-      }
-    }
-  }
-
-  return false;
+    float hx = get_head_x();
+    float hy = get_head_y();
+    // Simple circle check
+    float r_sum = sbpr + foe.r;
+    return Math::dist_sq(hx, hy, foe.x, foe.y) < r_sum * r_sum;
 }
 
 void Snake::on_food_eaten(Food f) {
   IncreaseSnake(f.size);
-  eaten.push_back(f);
+  eaten.push_back({f.x, f.y, f.size, f.color});
 }
 
 void Snake::IncreaseSnake(uint16_t volume) {
@@ -404,7 +495,7 @@ void Snake::IncreaseSnake(uint16_t volume) {
   UpdateSnakeConsts();
 }
 
-void Snake::DecreaseSnake(uint16_t volume) {
+void Snake::DecreaseSnake(uint16_t volume, uint8_t drop_size) {
   if (volume > fullness) {
     volume -= fullness;
     const uint16_t reduce = static_cast<uint16_t>(1 + volume / 100);
@@ -413,9 +504,13 @@ void Snake::DecreaseSnake(uint16_t volume) {
         const Body &last = parts.back();
         SpawnFood({static_cast<uint16_t>(last.x),
                    static_cast<uint16_t>(last.y),
-                   100,  // TODO(john.koepi) size dep on snake mass, use random
+                   drop_size,
                    skin});
         parts.pop_back();
+        
+        // Safety: Check if we hit the limit during decrease
+        uint16_t threshold = target_score > 0 ? target_score : 10;
+        if (parts.size() <= threshold) break;
       }
     }
     fullness = static_cast<uint16_t>(100 - volume % 100);
@@ -441,35 +536,44 @@ void Snake::SpawnFood(Food f) {
 
 void Snake::on_dead_food_spawn(SectorSeq *ss, std::function<float()> next_randomf) {
   auto end = parts.end();
-
   const float r = get_snake_body_part_radius();
   const uint16_t r2 = static_cast<uint16_t>(r * 3);
-
   const size_t count = static_cast<size_t>(sc * 2);
   const uint8_t food_size = static_cast<uint8_t>(100 / count);
 
   for (auto i = parts.begin(); i != end; ++i) {
+    // Safety check for NaN or negative coordinates
+    if (std::isnan(i->x) || std::isnan(i->y) || i->x < 0 || i->y < 0) continue;
+
     const uint16_t sx = static_cast<uint16_t>(i->x / WorldConfig::sector_size);
     const uint16_t sy = static_cast<uint16_t>(i->y / WorldConfig::sector_size);
-    if (sx > 0 && sx < WorldConfig::sector_count_along_edge - 1 && sy > 0 &&
-        sy < WorldConfig::sector_count_along_edge - 1) {
+    
+    // Bounds check before accessing sector array
+    if (sx < WorldConfig::sector_count_along_edge && 
+        sy < WorldConfig::sector_count_along_edge) {
+      
       for (size_t j = 0; j < count; j++) {
         Food f = {static_cast<uint16_t>(i->x + r - next_randomf() * r2),
                   static_cast<uint16_t>(i->y + r - next_randomf() * r2),
                   food_size, static_cast<uint8_t>(29 * next_randomf())};
 
-        Sector *sec = ss->get_sector(sx, sy);
-        sec->Insert(f);
-        spawn.push_back(f);
+        // Double check food bounds
+        if (f.x < WorldConfig::game_radius * 2 && f.y < WorldConfig::game_radius * 2) {
+            Sector *sec = ss->get_sector(sx, sy);
+            if (sec) {
+                sec->Insert(f);
+                spawn.push_back(f);
+            }
+        }
       }
     }
   }
 }
 
 float Snake::get_snake_scale() const { return gsc; }
-
 float Snake::get_snake_body_part_radius() const { return sbpr; }
 
+// Score Calculation
 std::array<float, WorldConfig::max_snake_parts> get_fmlts() {
   std::array<float, WorldConfig::max_snake_parts> data = {{0.0f}};
   for (size_t i = 0; i < data.size(); i++) {
@@ -491,23 +595,21 @@ uint16_t Snake::get_snake_score() const {
   static std::array<float, WorldConfig::max_snake_parts> fmlts = get_fmlts();
   static std::array<float, WorldConfig::max_snake_parts> fpsls = get_fpsls(fmlts);
 
-  size_t sct = parts.size() - 1;
+  // FIX: Use parts.size() as sct (length), not parts.size() - 1
+  // Protocol: sct is snake body parts count (length) taking values between [2 .. mscps]
+  size_t sct = parts.size();
+  
+  // FIX: Use target_score (length) if it's larger than current length
+  // This ensures the leaderboard shows the "intended" score during spawn animation
+  if (target_score > 0 && sct < target_score) {
+      sct = target_score;
+  }
+
   if (sct >= fmlts.size()) {
     sct = fmlts.size() - 1;
   }
 
-  return static_cast<uint16_t>(15.0f * (fpsls[sct] + fullness / 100.0f / fmlts[sct] - 1) - 5);
-}
-
-void Snake::UpdateSnakeConsts() {
-  gsc = 0.5f + 0.4f / fmaxf(1.0f, 1.0f * (parts.size() - 1 + 16) / 36.0f);
-  sc = fminf(6.0f, 1.0f + 1.0f * (parts.size() - 1 - 2) / 106.0f);
-
-  const float scang_x = 1.0f * (7 - parts.size() - 1) / 6.0f;
-  scang = 0.13f + 0.87f * scang_x * scang_x;
-
-  ssp = nsp1 + nsp2 * sc;
-  fsp = ssp + 0.1f;
-
-  sbpr = 29.0f * 0.5f /* render mode 2 const */ * sc;
+  // Formula: Math.floor(15 * (fpsls[snake.sct] + snake.fam / fmlts[snake.sct] - 1) - 5) / 1
+  // snake.fam is fullness / 100.0f (0..1)
+  return static_cast<uint16_t>(15.0f * (fpsls[sct] + (fullness / 100.0f) / fmlts[sct] - 1) - 5);
 }

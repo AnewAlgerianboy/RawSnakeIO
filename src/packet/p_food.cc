@@ -64,34 +64,26 @@ std::ostream& operator<<(std::ostream& out, const packet_add_food& p) {
 
 // FIX: Handle 'C' for Modern, 'c' for Legacy
 std::ostream& operator<<(std::ostream& out, const packet_eat_food& p) {
-  if (p.is_modern) {
-      // HEADER: [Time][Type='C']
-      out << write_uint16(p.client_time) << write_uint8('C'); 
-      
-      // PAYLOAD: [SectorX] [SectorY] [RelX] [RelY]
+  out << static_cast<PacketBase>(p);
+
+  // C Client (v31) -> Relative Coordinates
+  if (p.protocol_version >= 20) {
       uint8_t sx, sy, rx, ry;
       get_sector_coords(p.m_food.x, sx, rx);
       get_sector_coords(p.m_food.y, sy, ry);
-      
-      out << write_uint8(sx) << write_uint8(sy) 
+
+      out << write_uint8(sx) << write_uint8(sy)
           << write_uint8(rx) << write_uint8(ry);
-          
-      // EATER ID: [ID:2]
-      // C Client expects this immediately after Ry
-      if (p.snakeId > 0) {
-        out << write_uint16(p.snakeId);
-      }
-  } else {
-      // JS HEADER: [Time][Type='c'] (handled by PacketBase)
-      out << static_cast<PacketBase>(p); 
-      
-      // PAYLOAD: [AbsX:2] [AbsY:2]
-      out << write_uint16(p.m_food.x) << write_uint16(p.m_food.y);
-      
-      // EATER ID: [ID:2]
-      if (p.snakeId > 0) {
-        out << write_uint16(p.snakeId);
-      }
+  } 
+  // Legacy/JS Client (v1-14) -> Absolute Coordinates
+  else {
+      out << write_uint16(p.m_food.x)
+          << write_uint16(p.m_food.y);
+  }
+
+  // Eater ID (Same for both)
+  if (p.snakeId > 0) {
+    out << write_uint16(p.snakeId);
   }
   
   return out;

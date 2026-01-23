@@ -1,3 +1,9 @@
+/*
+==================================================
+FILE: game.h
+RELATIVE PATH: server/game.h
+==================================================
+*/
 #ifndef SRC_SERVER_GAME_H_
 #define SRC_SERVER_GAME_H_
 
@@ -7,6 +13,7 @@
 #include <string>
 #include <sstream>
 #include <iomanip>
+#include <mutex>
 
 #include "server/server.h"
 #include "game/world.h"
@@ -27,7 +34,6 @@ struct Session {
   snake_id_t snake_id = 0;
   long last_packet_time = 0;
 
-  // New: Track when the player died to delay the 'v' packet
   long death_timestamp = 0; 
 
   std::string name;
@@ -38,7 +44,7 @@ struct Session {
   uint8_t skin = 0;              
 
   bool is_modern_protocol() const { 
-      return protocol_version >= 25; // C Client is usually 31
+      return protocol_version >= 25; 
   }
 
   Session() = default;
@@ -69,8 +75,8 @@ class GameServer {
   void BroadcastLeaderboard();
   void BroadcastMinimap();
   
-  // New helper to handle delayed death messages
-  void ProcessDelayedDeaths();
+  void CleanupDeadSessions();
+  void SpawnBot();
 
   long last_leaderboard_time = 0;
   long last_minimap_time = 0;
@@ -84,6 +90,7 @@ class GameServer {
   void PrintWorldInfo();
 
  private:
+  // ... (templates and private members remain the same)
   static std::string packet_to_hex(const std::string& data, size_t max_bytes = 32) {
     std::stringstream ss;
     size_t len = std::min(data.size(), max_bytes);
@@ -133,6 +140,8 @@ class GameServer {
   IncomingConfig config;
   SessionMap sessions;
   ConnectionMap connections;
+  
+  std::mutex game_mutex;
 };
 
 #endif  // SRC_SERVER_GAME_H_

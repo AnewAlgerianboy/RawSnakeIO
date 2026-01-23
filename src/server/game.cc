@@ -88,6 +88,8 @@ void GameServer::NextTick(long last) {
 void GameServer::on_timer(error_code const &ec) {
   const long now = GetCurrentTime();
   const long dt = now - last_time_point;
+  
+  std::lock_guard<std::mutex> lock(game_mutex);
 
   if (ec) {
     endpoint.get_alog().write(alevel::app,
@@ -96,22 +98,48 @@ void GameServer::on_timer(error_code const &ec) {
   }
 
   world.Tick(dt);
+
+  // --- Bot Spawning ---
+  if (config.world.bot_respawn) {
+      int active_bots = 0;
+      for (auto &pair : world.GetSnakes()) {
+          if (pair.second->bot && !(pair.second->update & (change_dying | change_dead))) {
+              active_bots++;
+          }
+      }
+      if (active_bots < config.world.bots) {
+           SpawnBot();
+      }
+  }
+
+  // --- FIX: Faster Spawn Animation ---
+  for (auto &pair : world.GetSnakes()) {
+      Snake *s = pair.second.get();
+      
+      // If snake is smaller than target size (spawning phase)
+      if (s->parts.size() < s->target_score) {
+          // Increase growth rate: 
+          // 100 fullness = 1 body part.
+          // 50 fullness/tick = 1 part every 2 ticks (16ms).
+          // This makes the spawn animation fast and snappy like the original.
+          s->IncreaseSnake(50); 
+          s->update |= change_fullness | change_pos;
+      }
+  }
+
   BroadcastDebug();
   BroadcastUpdates();
   RemoveDeadSnakes();
-  ProcessDelayedDeaths();
 
-  // ---------------------------------------------------------
+  CleanupDeadSessions();
+
   // Broadcast Leaderboard (Every 2 seconds)
-  // ---------------------------------------------------------
   if (now - last_leaderboard_time > 2000) {
       BroadcastLeaderboard();
       last_leaderboard_time = now;
   }
 
-  // ---------------------------------------------------------
   // Broadcast Minimap (Every 1 second)
-  // ---------------------------------------------------------
   if (now - last_minimap_time > 1000) {
       BroadcastMinimap();
       last_minimap_time = now;
@@ -203,19 +231,19 @@ void GameServer::BroadcastDebug() {
 // UPDATED SendFoodUpdate (Hybrid Protocol Support)
 // ----------------------------------------------------------------------------
 void GameServer::SendFoodUpdate(Snake *ptr) {
-  // 1. Handle Eaten Food (Packet 'c' / 'C')
+  // 1. Handle Eaten Food
   if (!ptr->eaten.empty()) {
     const snake_id_t id = ptr->id;
 
     for (auto &s : sessions) {
         if (s.second.snake_id == 0) continue;
 
-        bool is_modern = s.second.is_modern_protocol();
+        // Get the specific version for this player
+        uint8_t ver = s.second.protocol_version;
         
-        for (const Food &f : ptr->eaten) {
-            // NOTE: The C Client expects [SectorX][SectorY][RelX][RelY][EaterID]
-            // The packet_eat_food constructor handles this split.
-            endpoint.send_binary(s.first, packet_eat_food(id, f, is_modern));
+        for (const auto &f : ptr->eaten) {
+            // Send constructed packet
+            endpoint.send_binary(s.first, packet_eat_food(id, Food(f.x, f.y, f.size, f.color), ver));
         }
     }
     ptr->eaten.clear();
@@ -235,27 +263,33 @@ void GameServer::SendFoodUpdate(Snake *ptr) {
 }
 
 // ----------------------------------------------------------------------------
-// NEW ProcessDelayedDeaths
+// NEW CleanupDeadSessions
 // ----------------------------------------------------------------------------
-
-void GameServer::ProcessDelayedDeaths() {
+void GameServer::CleanupDeadSessions() {
     const long now = GetCurrentTime();
+    std::vector<connection_hdl> to_close;
     
-    // Use iterator loop instead of range-based loop
     for (auto it = sessions.begin(); it != sessions.end(); ++it) {
         Session &ss = it->second;
 
-        // If death_timestamp is set (>0) and 2 seconds (2000ms) have passed
-        if (ss.death_timestamp > 0 && (now - ss.death_timestamp > 2000)) {
-            
-            // Send the 'v' packet (Game Over)
-            // send_binary requires the iterator 'it'
-            send_binary(it, packet_end(packet_end::status_death));
-            
-            // Reset session state
-            ss.death_timestamp = 0;
-            ss.snake_id = 0; // Back to main menu
+        if (ss.death_timestamp > 0) {
+            // After 2 seconds, kick the client.
+            if (now - ss.death_timestamp > 2000) {
+                to_close.push_back(it->first);
+                
+                // CRITICAL FIX: Mark ID as 0 immediately.
+                // This prevents BroadcastLeaderboard/Minimap from trying 
+                // to send data to this socket while it's closing, 
+                // which stops the "invalid state" errors.
+                ss.snake_id = 0; 
+            }
         }
+    }
+
+    // Close connections safely
+    for (connection_hdl hdl : to_close) {
+        error_code ec;
+        endpoint.close(hdl, websocketpp::close::status::normal, "Game Over", ec);
     }
 }
 
@@ -263,44 +297,53 @@ void GameServer::ProcessDelayedDeaths() {
 // UPDATED BroadcastUpdates
 // ----------------------------------------------------------------------------
 void GameServer::BroadcastUpdates() {
-  for (auto ptr : world.GetChangedSnakes()) {
+  // Use a copy to safely iterate if map changes (though removal is deferred to RemoveDeadSnakes)
+  auto changed_snakes = world.GetChangedSnakes();
+
+  for (auto ptr : changed_snakes) {
+    if (!ptr) continue;
     const snake_id_t id = ptr->id;
     const uint8_t flags = ptr->update;
 
     if (flags & change_dead) continue;
 
     if (flags & change_dying) {
-      // 1. Notify logs
       endpoint.get_alog().write(alevel::app, "Snake died: " + std::to_string(id));
 
-      // 2. Handle Human Player Death Logic
+      // 1. Spawn Food (CRITICAL: Must be first so clients see the food generated)
+      if (world.GetSnake(id) != world.GetSnakes().end()) {
+          ptr->on_dead_food_spawn(&world.GetSectors(), [&]() -> float {
+            return world.NextRandomf();
+          });
+          SendFoodUpdate(ptr);
+      }
+
+      // 2. Broadcast Removal ('s') to EVERYONE.
+      // Status 1 = Died (Explosion Animation).
+      broadcast_binary(packet_remove_snake(id, packet_remove_snake::status_snake_died));
+
+      // 3. Send Game Over ('v') ONLY to the victim.
+      // This is sent last because the client might disconnect immediately upon receiving 'v'.
       if (!ptr->bot) {
         const auto ses_i = LoadSessionIter(id);
         if (ses_i != sessions.end()) {
-          // DO NOT send 'v' (packet_end) here immediately.
-          // Set the timestamp. on_timer will handle sending 'v' after 2 seconds.
-          ses_i->second.death_timestamp = GetCurrentTime();
+          try {
+            send_binary(ses_i, packet_end(packet_end::status_death));
+            ses_i->second.death_timestamp = GetCurrentTime();
+          } catch (...) {
+             // Swallow errors if client disconnected
+          }
         }
       }
 
-      // 3. Spawn Food from body
-      ptr->on_dead_food_spawn(&world.GetSectors(), [&]() -> float {
-        return world.NextRandomf();
-      });
-      SendFoodUpdate(ptr);
-
-      // 4. Broadcast Removal to all clients (so visual snake disappears/turns to food)
-      broadcast_binary(packet_remove_snake(ptr->id, packet_remove_snake::status_snake_died));
-      
-      // 5. Mark logic
+      // 4. Mark Dead (Logic only)
       ptr->update |= change_dead;
-      world.GetDead().push_back(ptr->id); // Will be removed from world in RemoveDeadSnakes()
+      world.GetDead().push_back(id); 
 
       continue;
     }
 
     if (flags) {
-      // Rotation
       if (flags & (change_angle | change_speed)) {
         packet_rotation rot = packet_rotation();
         rot.snakeId = id;
@@ -319,7 +362,6 @@ void GameServer::BroadcastUpdates() {
         broadcast_binary(rot);
       }
 
-      // Position / Growth
       if (flags & change_pos) {
         ptr->update ^= change_pos;
         if (ptr->clientPartsIndex < ptr->parts.size()) {
@@ -335,10 +377,8 @@ void GameServer::BroadcastUpdates() {
 
         SendFoodUpdate(ptr);
         
-        // Update Viewport for Human
-        if (!ptr->bot) {
+        if (!ptr->bot && !(ptr->update & change_dying)) {
           const auto ses_i = LoadSessionIter(id);
-          // Only update viewport if not currently dead/waiting for game over
           if (ses_i != sessions.end() && ses_i->second.death_timestamp == 0) {
               SendPOVUpdateTo(ses_i, ptr);
               if (flags & change_fullness) {
@@ -404,75 +444,111 @@ void GameServer::BroadcastLeaderboard() {
 }
 
 void GameServer::BroadcastMinimap() {
-  packet_minimap map_packet;
-
-  // 1. Define Map Grid (80x80 is standard client size)
-  const int map_dim = 80;
-  // Initialize with 0s
+  // 1. Define Map Grid Size
+  // Original is 80. You can increase this (e.g. 144) for C clients if desired,
+  // but JS clients strictly expect 80x80 data in 'u' packets.
+  const uint16_t map_dim = 144;
+  
   std::vector<uint8_t> grid(map_dim * map_dim, 0);
 
   // 2. Map World Coordinates to Grid Coordinates
-  // We map 0..43200 (2 * game_radius) directly to 0..80.
-  // scale = 80 / 43200
-  float scale = 80.0f / (WorldConfig::game_radius * 2.0f);
+  float scale = (float)map_dim / (WorldConfig::game_radius * 2.0f);
 
   for (auto &pair : world.GetSnakes()) {
     Snake* s = pair.second.get();
-    if (s->parts.empty()) continue;
+    if (s->parts.empty() || (s->update & change_dead)) continue;
 
-    // Optimization: Map HEAD and every 4th body part
     for (size_t i = 0; i < s->parts.size(); i += 4) {
       const Body& b = s->parts[i];
-      
       int mx = static_cast<int>(b.x * scale);
       int my = static_cast<int>(b.y * scale);
-
-      // Clamp coordinates
-      if (mx < 0) mx = 0;
-      if (mx >= map_dim) mx = map_dim - 1;
-      if (my < 0) my = 0;
-      if (my >= map_dim) my = map_dim - 1;
-
-      grid[my * map_dim + mx] = 1; // Mark pixel
+      if (mx >= 0 && mx < map_dim && my >= 0 && my < map_dim) {
+          grid[my * map_dim + mx] = 1; 
+      }
     }
   }
 
-  // 3. Compress for Client (RLE-like encoding)
-  int current_skip = 0;
+  // ---------------------------------------------------------
+  // A. Build Forward Packet ('u') for JS Clients
+  // ---------------------------------------------------------
+  packet_minimap packet_fwd(map_dim);
+  packet_fwd.packet_type = packet_t_minimap_legacy; // 'u'
   
+  int skip = 0;
   for (size_t i = 0; i < grid.size(); ) {
     if (grid[i] == 0) {
-      current_skip++;
-      if (current_skip >= 127) {
-        map_packet.data.push_back(static_cast<uint8_t>(128 + current_skip));
-        current_skip = 0;
+      skip++;
+      if (skip >= 127) {
+        packet_fwd.data.push_back(static_cast<uint8_t>(128 + skip));
+        skip = 0;
       }
       i++;
     } else {
-      if (current_skip > 0) {
-        map_packet.data.push_back(static_cast<uint8_t>(128 + current_skip));
-        current_skip = 0;
+      if (skip > 0) {
+        packet_fwd.data.push_back(static_cast<uint8_t>(128 + skip));
+        skip = 0;
       }
-      
       uint8_t chunk = 0;
       for (int bit = 0; bit < 7; ++bit) {
-        if (i + bit < grid.size()) {
-          if (grid[i + bit] != 0) {
-             chunk |= (1 << (6 - bit));
-          }
-        }
+        if (i + bit < grid.size() && grid[i + bit] != 0) chunk |= (1 << (6 - bit));
       }
-      
-      map_packet.data.push_back(chunk);
+      packet_fwd.data.push_back(chunk);
       i += 7;
     }
   }
-  
-  if (current_skip > 0) {
-    map_packet.data.push_back(static_cast<uint8_t>(128 + current_skip));
-  }
+  if (skip > 0) packet_fwd.data.push_back(static_cast<uint8_t>(128 + skip));
 
-  broadcast_binary(map_packet);
+  // ---------------------------------------------------------
+  // B. Build Reverse Packet ('M') for C Clients
+  // ---------------------------------------------------------
+  packet_minimap packet_rev(map_dim);
+  packet_rev.packet_type = packet_t_minimap; // 'M'
+  
+  skip = 0;
+  // Iterate backwards!
+  for (int i = (map_dim * map_dim) - 1; i >= 0; ) {
+    if (grid[i] == 0) {
+      skip++;
+      // Cap at 126 for C client safety (128+126 = 254 < 255)
+      if (skip >= 126) {
+        packet_rev.data.push_back(static_cast<uint8_t>(128 + skip));
+        skip = 0;
+      }
+      i--;
+    } else {
+      if (skip > 0) {
+        packet_rev.data.push_back(static_cast<uint8_t>(128 + skip));
+        skip = 0;
+      }
+      uint8_t chunk = 0;
+      // Pack bits backwards
+      for (int bit = 0; bit < 7; ++bit) {
+        if (i - bit >= 0 && grid[i - bit] != 0) chunk |= (1 << (6 - bit));
+      }
+      packet_rev.data.push_back(chunk);
+      i -= 7;
+    }
+  }
+  if (skip > 0) packet_rev.data.push_back(static_cast<uint8_t>(128 + skip));
+
+  // ---------------------------------------------------------
+  // C. Send appropriate packet to each session
+  // ---------------------------------------------------------
+  const long now = GetCurrentTime();
+  for (auto it = sessions.begin(); it != sessions.end(); ++it) {
+      if (it->second.snake_id == 0) continue;
+      
+      const uint16_t interval = static_cast<uint16_t>(now - it->second.last_packet_time);
+      it->second.last_packet_time = now;
+
+      if (it->second.is_modern_protocol()) {
+          packet_rev.client_time = interval;
+          endpoint.send_binary(it->first, packet_rev);
+      } else {
+          packet_fwd.client_time = interval;
+          endpoint.send_binary(it->first, packet_fwd);
+      }
+  }
 }
 
 // ----------------------------------------------------------------------------
@@ -517,10 +593,12 @@ void GameServer::on_socket_init(websocketpp::connection_hdl, boost::asio::ip::tc
 }
 
 void GameServer::on_open(connection_hdl hdl) {
+  std::lock_guard<std::mutex> lock(game_mutex);
   sessions[hdl] = Session(0, GetCurrentTime());
 }
 
 void GameServer::on_message(connection_hdl hdl, message_ptr ptr) {
+  std::lock_guard<std::mutex> lock(game_mutex);
   if (ptr->get_opcode() != opcode::binary) {
     endpoint.get_alog().write(alevel::app,
         "Unknown incoming message opcode " + std::to_string(ptr->get_opcode()));
@@ -552,6 +630,18 @@ void GameServer::on_message(connection_hdl hdl, message_ptr ptr) {
   }
 
   Session &ss = ses_i->second;
+
+  if (ss.death_timestamp > 0) {
+      // Allow only the 's' packet (Respawn) or Ping, block others
+      std::stringstream temp_buf(ptr->get_payload());
+      in_packet_t temp_type;
+      temp_buf.read(reinterpret_cast<char*>(&temp_type), 1);
+      
+      // Only allow respawn ('s') or ping (251). Block steering/speed.
+      if (temp_type != in_packet_t_username_skin && temp_type != in_packet_t_ping) {
+          return;
+      }
+  }
 
   if (packet_type <= 250 && len == 1 && 
       packet_type != in_packet_t_start_login && 
@@ -634,7 +724,8 @@ void GameServer::on_message(connection_hdl hdl, message_ptr ptr) {
         endpoint.get_alog().write(alevel::app, connect_log.str());
 
         if (ss.snake_id == 0) {
-            const auto new_snake_ptr = world.CreateSnake();
+            // Pass h_snake_start_score as target score
+            const auto new_snake_ptr = world.CreateSnake(config.world.h_snake_start_score);
             new_snake_ptr->name = ss.name;
             new_snake_ptr->skin = ss.skin;
             new_snake_ptr->custom_skin_data = ss.custom_skin_data;
@@ -712,6 +803,7 @@ void GameServer::on_message(connection_hdl hdl, message_ptr ptr) {
 }
 
 void GameServer::on_close(connection_hdl hdl) {
+  std::lock_guard<std::mutex> lock(game_mutex);
   const auto ptr = sessions.find(hdl);
   if (ptr != sessions.end()) {
     const snake_id_t snakeId = ptr->second.snake_id;
@@ -758,9 +850,14 @@ long GameServer::GetCurrentTime() {
 void GameServer::DoSnake(snake_id_t id, std::function<void(Snake *)> f) {
   if (id > 0) {
     const auto snake_i = world.GetSnake(id);
-    if (snake_i->first == id) {
-      f(snake_i->second.get());
+    
+    // --- SEGFAULT FIX ---
+    // We MUST check if the snake was actually found before accessing it.
+    // If snake_i equals world.GetSnakes().end(), the snake is gone/dead.
+    if (snake_i != world.GetSnakes().end()) {
+        f(snake_i->second.get());
     }
+    // --------------------
   }
 }
 
@@ -780,4 +877,17 @@ GameServer::SessionMap::iterator GameServer::LoadSessionIter(
   }
 
   return ses_i;
+}
+
+void GameServer::SpawnBot() {
+  auto new_bot = world.CreateSnakeBot();
+  world.AddSnake(new_bot);
+
+  // Broadcast to all clients
+  for (auto &s : sessions) {
+    if (s.second.snake_id == 0) continue;
+    bool is_modern = s.second.is_modern_protocol();
+    endpoint.send_binary(s.first, packet_add_snake(new_bot.get(), is_modern));
+  }
+  broadcast_binary(packet_move(new_bot.get()));
 }

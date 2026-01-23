@@ -42,6 +42,7 @@ class BoundBox : public BoundBoxPos {
   SectorVec sectors;
 
   BoundBox() = default;
+  virtual ~BoundBox(); // Virtual destructor for cleanup
   BoundBox(BoundBoxPos in_pos, uint16_t in_id, const Snake *in_snake, SectorVec in_sectors)
       : BoundBoxPos(in_pos), id(in_id), snake(in_snake), sectors(in_sectors) {}
 
@@ -58,6 +59,8 @@ class Sector {
  public:
   uint8_t x;
   uint8_t y;
+
+  uint16_t max_food_capacity = 0; 
 
   BoundBoxPos box;
   BoundBoxVec snakes;

@@ -28,6 +28,12 @@ bool BoundBox::IsPresent(const Sector *s) {
 
 void BoundBox::Sort() { std::sort(sectors.begin(), sectors.end()); }
 
+BoundBox::~BoundBox() {
+  for (Sector *s : sectors) {
+    s->RemoveSnake(id);
+  }
+}
+
 size_t BoundBox::get_sectors_count() { return sectors.size(); }
 
 size_t BoundBox::get_snakes_in_sectors_count() {

@@ -1,3 +1,9 @@
+/*
+==================================================
+FILE: world.h
+RELATIVE PATH: game/world.h
+==================================================
+*/
 #ifndef SRC_GAME_WORLD_H_
 #define SRC_GAME_WORLD_H_
 
@@ -17,10 +23,12 @@ class World {
 
   void Tick(long dt);
 
-  Snake::Ptr CreateSnake();
+  Snake::Ptr CreateSnake(int start_len = 0);
   Snake::Ptr CreateSnakeBot();
   void SpawnNumSnakes(const int count);
   void CheckSnakeBounds(Snake *s);
+
+  void RegenerateFood(); 
 
   void InitRandom();
   int NextRandom();
@@ -37,25 +45,21 @@ class World {
 
   SnakeVec& GetChangedSnakes();
 
-  // before calling this, snake must be flushed()
   void FlushChanges(snake_id_t id);
-  // before calling this, all snakes must be flushed()
   void FlushChanges();
 
  private:
   void TickSnakes(long dt);
+  
+  // --- NEW: Helper to check for collisions before spawning ---
+  bool IsLocationSafe(float x, float y, float safety_radius);
 
  private:
-  // TODO(john.koepi): reserve to collections
   SnakeMap snakes;
   Ids dead;
   SectorSeq sectors;
   SnakeVec changes;
 
-  // TODO(john.koepi) pools
-  // TODO(john.koepi) sorted checker
-
-  // TODO(john.koepi) manage overflow, reuse old?
   uint16_t lastSnakeId = 0;
   long ticks = 0;
   uint32_t frames = 0;
